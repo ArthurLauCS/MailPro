@@ -17,4 +17,4 @@ tokio = { version = "1", features = ["rt", "net", "time", "io-util"] }
 tokio-native-tls = "0.3"
 tokio-socks = "0.5"
 url = "2"
-windows = { version = "0.62", features = ["Win32_Security_Credentials", "Win32_System_Console"] }
+windows = { version = "0.62", features = ["Win32_Foundation", "Win32_Security_Credentials", "Win32_System_Console"] }

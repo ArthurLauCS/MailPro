@@ -8,10 +8,14 @@ mod webview;
 use gpui::prelude::*;
 use gpui::{App, Bounds, TitlebarOptions, WindowBackgroundAppearance, WindowBounds, WindowOptions, px, size, transparent_black};
 use gpui_component::Root;
-use mailpro_core::message;
 use mailpro_core::store::{self, Store};
+use mailpro_core::{cred, message};
 
 fn main() {
+    // 卸载程序调用：删掉凭据管理器里本程序存的密码，数据目录由卸载程序自己删
+    if std::env::args().nth(1).as_deref() == Some("--purge-credentials") {
+        std::process::exit(cred::purge().is_err() as i32);
+    }
     // 带 .eml 参数时直接显示这封，隐私测试用（scripts/drive.ps1）
     let eml = std::env::args().nth(1).map(|p| message::parse(&std::fs::read(&p).expect("读取邮件")).expect("解析邮件"));
     let path = store::path().expect("数据目录");

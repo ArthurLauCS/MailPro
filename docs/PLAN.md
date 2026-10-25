@@ -74,6 +74,8 @@ tests/privacy  跟踪测试邮件 + 本地计数服务器
    - 验证：看收到邮件的原始头。
 7. **本地搜索**：SQLite FTS5。
 8. **收尾**：设置导出 / 导入、图标、安装包、README。
+   - 安装包：Inno Setup 按当前用户安装（`scripts/installer.ps1`，产物只留当前版本）；卸载时删数据目录 `%LOCALAPPDATA%\MailPro`，并运行 `mailpro.exe --purge-credentials` 删凭据管理器里 `MailPro/` 开头的全部凭据。图标为粉色信封带封蜡锁孔（`scripts/icon.py`）。
+   - 现状：图标、安装包、README（英文为主，附中文版）、第三方许可声明已完成，0.1.0 发布在 GitHub Releases；设置导出 / 导入未做。
 
 暂不做：新信桌面通知、关窗口后缩到托盘继续收信。
 
