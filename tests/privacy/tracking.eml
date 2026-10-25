@@ -1,0 +1,90 @@
+From: Tracker Test <news@tracker.example>
+To: you@example.com
+Subject: =?UTF-8?B?6ZqQ56eB5rWL6K+V77ya6Lef6Liq5omL5q615ZCI6ZuG?=
+Date: Sat, 25 Oct 2026 09:00:00 -0700
+Message-ID: <tracking-test@tracker.example>
+MIME-Version: 1.0
+Content-Type: multipart/related; boundary="rel"
+
+--rel
+Content-Type: text/html; charset=utf-8
+Content-Transfer-Encoding: 8bit
+
+<!DOCTYPE html>
+<html>
+<head>
+<meta http-equiv="refresh" content="5;url=http://127.0.0.1:8765/v/meta-refresh">
+<base href="http://127.0.0.1:8765/v/base/">
+<link rel="stylesheet" href="http://127.0.0.1:8765/v/link-stylesheet">
+<link rel="icon" href="http://127.0.0.1:8765/v/link-icon">
+<link rel="prefetch" href="http://127.0.0.1:8765/v/link-prefetch">
+<link rel="preload" as="image" href="http://127.0.0.1:8765/v/link-preload">
+<link rel="preconnect" href="http://127.0.0.1:8765">
+<link rel="dns-prefetch" href="//127.0.0.1:8765">
+<script src="http://127.0.0.1:8765/v/script-src"></script>
+<style>
+@import url("http://127.0.0.1:8765/v/css-import");
+@font-face { font-family: Trk; src: url("http://127.0.0.1:8765/v/css-font-face"); }
+body { font-family: Trk, sans-serif; background-image: url("http://127.0.0.1:8765/v/css-body-bg"); }
+.before::before { content: url("http://127.0.0.1:8765/v/css-content"); }
+.list { list-style-image: url("http://127.0.0.1:8765/v/css-list-style"); }
+.border { border: 10px solid; border-image: url("http://127.0.0.1:8765/v/css-border-image") 30; }
+.cursor { cursor: url("http://127.0.0.1:8765/v/css-cursor"), auto; }
+.mask { -webkit-mask-image: url("http://127.0.0.1:8765/v/css-mask"); }
+.set { background-image: image-set(url("http://127.0.0.1:8765/v/css-image-set") 1x); }
+.hover:hover { background: url("http://127.0.0.1:8765/v/css-hover"); }
+@media print { body { background: url("http://127.0.0.1:8765/v/css-print"); } }
+.blue { color: #1a73e8; font-weight: bold; }
+</style>
+</head>
+<body background="http://127.0.0.1:8765/v/body-background">
+<h1>隐私测试邮件</h1>
+<p class="blue">下面的蓝色方块是内嵌图片（cid），应当正常显示；其他所有资源都指向本机计数服务器，应当一个都不加载。</p>
+<p><img src="cid:logo@mailpro.test" width="24" height="24" alt="cid"> 内嵌图片（cid）
+<img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABgAAAAYCAIAAABvFaqvAAAAH0lEQVR4nGOQKn5BFcQwatCoQaMGjRo0atCoQQNvEACugkdu/BVv9QAAAABJRU5ErkJggg==" width="24" height="24" alt="data"> data 图片</p>
+
+<img src="http://127.0.0.1:8765/v/img-pixel" width="1" height="1" alt="">
+<img src="//127.0.0.1:8765/v/img-protocol-relative" width="1" height="1" alt="">
+<img src="relative-img" width="1" height="1" alt="">
+<img src=" HTTP://127.0.0.1:8765/v/img-upper-space" width="1" height="1" alt="">
+<img src="&#104;ttp://127.0.0.1:8765/v/img-entity" width="1" height="1" alt="">
+<img srcset="http://127.0.0.1:8765/v/img-srcset 1x" width="1" height="1" alt="">
+<img src="data:image/gif;base64,R0lGODlhAQABAAAAACw=" lowsrc="http://127.0.0.1:8765/v/img-lowsrc" alt="">
+<picture><source srcset="http://127.0.0.1:8765/v/picture-source"><img src="http://127.0.0.1:8765/v/picture-img" width="1" height="1" alt=""></picture>
+<input type="image" src="http://127.0.0.1:8765/v/input-image" alt="">
+<video poster="http://127.0.0.1:8765/v/video-poster" src="http://127.0.0.1:8765/v/video-src" width="1" height="1"><track src="http://127.0.0.1:8765/v/video-track"></video>
+<audio src="http://127.0.0.1:8765/v/audio-src" autoplay></audio>
+<iframe src="http://127.0.0.1:8765/v/iframe" width="1" height="1"></iframe>
+<object data="http://127.0.0.1:8765/v/object" width="1" height="1"></object>
+<embed src="http://127.0.0.1:8765/v/embed" width="1" height="1">
+<svg width="1" height="1"><image href="http://127.0.0.1:8765/v/svg-image" width="1" height="1"/><use href="http://127.0.0.1:8765/v/svg-use#x"/></svg>
+<noscript><img src="http://127.0.0.1:8765/v/noscript-img" width="1" height="1" alt=""></noscript>
+
+<table background="http://127.0.0.1:8765/v/table-background" width="300"><tr>
+<td background="http://127.0.0.1:8765/v/td-background">表格背景</td>
+<td style="background-image: url('http://127.0.0.1:8765/v/inline-style-bg')">行内样式背景</td>
+</tr></table>
+
+<div class="before">伪元素 content</div>
+<ul class="list"><li>列表图标</li></ul>
+<div class="border">边框图片</div>
+<div class="cursor">鼠标指针</div>
+<div class="mask">遮罩</div>
+<div class="set">image-set</div>
+<div class="hover">悬停背景（鼠标移上来）</div>
+
+<form action="http://127.0.0.1:8765/v/form-action"><button>表单提交</button></form>
+<p>链接：<a href="https://shop.example/sale?utm_source=newsletter&amp;utm_medium=email&amp;mc_eid=abc123" ping="http://127.0.0.1:8765/v/a-ping">带跟踪参数的链接</a>
+· <a href="https://www.google.com/url?q=https://example.org/&amp;sa=D" target="_blank">Google 跳转壳（新窗口）</a>
+· <a href="mailto:someone@example.com">mailto</a></p>
+<p style="font-family: 'Microsoft YaHei'">中文排版：落霞与孤鹜齐飞，秋水共长天一色。</p>
+</body>
+</html>
+
+--rel
+Content-Type: image/png
+Content-ID: <logo@mailpro.test>
+Content-Transfer-Encoding: base64
+
+iVBORw0KGgoAAAANSUhEUgAAABgAAAAYCAIAAABvFaqvAAAAH0lEQVR4nGOQKn5BFcQwatCoQaMGjRo0atCoQQNvEACugkdu/BVv9QAAAABJRU5ErkJggg==
+--rel--

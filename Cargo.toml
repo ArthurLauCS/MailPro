@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/core"]
+members = ["crates/core", "crates/app"]
 
 # 开发构建也优化依赖，否则界面框架慢得看不出真实性能
 [profile.dev.package."*"]
