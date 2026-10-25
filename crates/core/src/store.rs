@@ -1,0 +1,375 @@
+//! 本地缓存：账号、文件夹、邮件头和标记、下载过的正文，以及还没写回服务器的已读改动。
+
+use rusqlite::{Connection, OptionalExtension, Result, params};
+use std::collections::HashSet;
+use std::time::Duration;
+
+/// 标记位，存在 `message.flags`
+pub const SEEN: u8 = 1;
+pub const FLAGGED: u8 = 2;
+pub const ANSWERED: u8 = 4;
+
+#[derive(Clone)]
+pub struct Account {
+    pub id: i64,
+    /// 同时是登录名
+    pub email: String,
+    pub host: String,
+    pub port: u16,
+    /// SOCKS5 代理 `主机:端口`；None 为直连
+    pub proxy: Option<String>,
+}
+
+#[derive(Clone)]
+pub struct Folder {
+    pub id: i64,
+    /// 服务器上的原名，非 ASCII 是 modified UTF-7；显示用 [`crate::imap::folder_name`]
+    pub name: String,
+    pub uidvalidity: Option<u32>,
+    /// 服务器的 HIGHESTMODSEQ，整个文件夹同步完才记下
+    pub modseq: Option<u64>,
+    /// 首次全量同步已完成；未完成时每次同步都和服务器对账，断了接着补
+    pub complete: bool,
+    /// 特殊用途：inbox、flagged、important、sent、drafts、all、archive、junk、trash；自建文件夹为 None
+    pub role: Option<String>,
+}
+
+pub struct Header {
+    pub uid: u32,
+    pub flags: u8,
+    /// 服务器收到的时间（INTERNALDATE），Unix 秒
+    pub date: i64,
+    pub size: u32,
+    pub attach: bool,
+    pub from_name: String,
+    pub from_addr: String,
+    pub subject: String,
+}
+
+const SCHEMA: &str = "
+PRAGMA foreign_keys = ON;
+CREATE TABLE IF NOT EXISTS account (
+    id INTEGER PRIMARY KEY, email TEXT NOT NULL UNIQUE, host TEXT NOT NULL, port INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS folder (
+    id INTEGER PRIMARY KEY, account INTEGER NOT NULL REFERENCES account ON DELETE CASCADE,
+    name TEXT NOT NULL, uidvalidity INTEGER, modseq INTEGER, complete INTEGER NOT NULL DEFAULT 0,
+    UNIQUE (account, name));
+CREATE TABLE IF NOT EXISTS message (
+    folder INTEGER NOT NULL REFERENCES folder ON DELETE CASCADE, uid INTEGER NOT NULL,
+    flags INTEGER NOT NULL, date INTEGER NOT NULL, size INTEGER NOT NULL, attach INTEGER NOT NULL,
+    from_name TEXT NOT NULL, from_addr TEXT NOT NULL, subject TEXT NOT NULL,
+    PRIMARY KEY (folder, uid)) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS message_date ON message (folder, date);
+-- 原始 RFC 822 字节，下载后一直留着
+CREATE TABLE IF NOT EXISTS body (
+    folder INTEGER NOT NULL, uid INTEGER NOT NULL, raw BLOB NOT NULL, PRIMARY KEY (folder, uid),
+    FOREIGN KEY (folder, uid) REFERENCES message ON DELETE CASCADE);
+-- 本地改了、还没写回服务器的已读状态；邮件在服务器上删掉时跟着删
+CREATE TABLE IF NOT EXISTS pending (
+    folder INTEGER NOT NULL, uid INTEGER NOT NULL, seen INTEGER NOT NULL, PRIMARY KEY (folder, uid),
+    FOREIGN KEY (folder, uid) REFERENCES message ON DELETE CASCADE);
+-- 本软件自己的设置，如界面语言
+CREATE TABLE IF NOT EXISTS setting (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+-- 总是加载远程图片的发件人，地址存小写
+CREATE TABLE IF NOT EXISTS image_sender (addr TEXT PRIMARY KEY) WITHOUT ROWID;
+";
+
+/// 建表之后按顺序执行，`PRAGMA user_version` 记已执行的条数；只能往后加
+const MIGRATIONS: &[&str] = &["ALTER TABLE account ADD COLUMN proxy TEXT", "ALTER TABLE folder ADD COLUMN role TEXT"];
+
+pub struct Store(Connection);
+
+/// `%LOCALAPPDATA%\MailPro\mail.db`，目录不存在就建
+pub fn path() -> std::io::Result<String> {
+    let dir = std::env::var("LOCALAPPDATA").map_err(std::io::Error::other)? + "\\MailPro";
+    std::fs::create_dir_all(&dir)?;
+    Ok(dir + "\\mail.db")
+}
+
+impl Store {
+    pub fn open(path: &str) -> Result<Store> {
+        let db = Connection::open(path)?;
+        // 命令行和后台同步可能同时写同一个库
+        db.busy_timeout(Duration::from_secs(5))?;
+        db.query_row("PRAGMA journal_mode = WAL", [], |_| Ok(()))?;
+        db.execute_batch(SCHEMA)?;
+        let done: usize = db.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+        for (i, m) in MIGRATIONS.iter().enumerate().skip(done) {
+            db.execute_batch(&format!("BEGIN; {m}; PRAGMA user_version = {}; COMMIT;", i + 1))?;
+        }
+        Ok(Store(db))
+    }
+
+    /// 新增或按邮箱更新，返回账号 id
+    pub fn add_account(&self, a: &Account) -> Result<i64> {
+        self.0.query_row(
+            "INSERT INTO account (email, host, port, proxy) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT (email) DO UPDATE SET host = ?2, port = ?3, proxy = ?4 RETURNING id",
+            params![a.email, a.host, a.port, a.proxy],
+            |r| r.get(0),
+        )
+    }
+
+    pub fn set_proxy(&self, account: i64, proxy: Option<&str>) -> Result<()> {
+        self.0.execute("UPDATE account SET proxy = ?2 WHERE id = ?1", params![account, proxy])?;
+        Ok(())
+    }
+
+    pub fn setting(&self, key: &str) -> Result<Option<String>> {
+        self.0.query_row("SELECT value FROM setting WHERE key = ?1", [key], |r| r.get(0)).optional()
+    }
+
+    pub fn set_setting(&self, key: &str, value: &str) -> Result<()> {
+        self.0.execute("INSERT OR REPLACE INTO setting (key, value) VALUES (?1, ?2)", [key, value])?;
+        Ok(())
+    }
+
+    /// 发件人在不在“总是加载图片”名单里；地址不分大小写
+    pub fn images_allowed(&self, addr: &str) -> Result<bool> {
+        self.0.query_row("SELECT 1 FROM image_sender WHERE addr = ?1", [addr.to_lowercase()], |_| Ok(())).optional().map(|r| r.is_some())
+    }
+
+    pub fn allow_images(&self, addr: &str, allow: bool) -> Result<()> {
+        let sql = if allow { "INSERT OR IGNORE INTO image_sender (addr) VALUES (?1)" } else { "DELETE FROM image_sender WHERE addr = ?1" };
+        self.0.execute(sql, [addr.to_lowercase()])?;
+        Ok(())
+    }
+
+    pub fn accounts(&self) -> Result<Vec<Account>> {
+        let mut st = self.0.prepare("SELECT id, email, host, port, proxy FROM account ORDER BY id")?;
+        st.query_map([], |r| {
+            Ok(Account { id: r.get(0)?, email: r.get(1)?, host: r.get(2)?, port: r.get(3)?, proxy: r.get(4)? })
+        })?
+        .collect()
+    }
+
+    /// 按服务器的文件夹列表（原名, 特殊用途）增删本地文件夹，删掉的连同邮件一起删
+    pub fn set_folders(&self, account: i64, folders: &[(String, Option<&str>)]) -> Result<()> {
+        let tx = self.0.unchecked_transaction()?;
+        for f in self.folders(account)? {
+            if !folders.iter().any(|(n, _)| *n == f.name) {
+                tx.execute("DELETE FROM folder WHERE id = ?1", [f.id])?;
+            }
+        }
+        for (name, role) in folders {
+            tx.execute(
+                "INSERT INTO folder (account, name, role) VALUES (?1, ?2, ?3)
+                 ON CONFLICT (account, name) DO UPDATE SET role = ?3",
+                params![account, name, role],
+            )?;
+        }
+        tx.commit()
+    }
+
+    /// 系统文件夹按固定顺序在前，自建文件夹按名字接在后面
+    pub fn folders(&self, account: i64) -> Result<Vec<Folder>> {
+        let mut st = self.0.prepare(
+            "SELECT id, name, uidvalidity, modseq, complete, role FROM folder WHERE account = ?1
+             ORDER BY CASE role WHEN 'inbox' THEN 0 WHEN 'flagged' THEN 1 WHEN 'important' THEN 2 WHEN 'sent' THEN 3
+             WHEN 'drafts' THEN 4 WHEN 'all' THEN 5 WHEN 'archive' THEN 5 WHEN 'junk' THEN 6 WHEN 'trash' THEN 7
+             ELSE 8 END, name",
+        )?;
+        st.query_map([account], |r| {
+            Ok(Folder {
+                id: r.get(0)?,
+                name: r.get(1)?,
+                uidvalidity: r.get(2)?,
+                modseq: r.get(3)?,
+                complete: r.get(4)?,
+                role: r.get(5)?,
+            })
+        })?
+        .collect()
+    }
+
+    /// UIDVALIDITY 变了说明服务器重新编了号，这个文件夹的缓存全部作废
+    pub fn reset_folder(&self, folder: i64, uidvalidity: u32) -> Result<()> {
+        let tx = self.0.unchecked_transaction()?;
+        tx.execute("DELETE FROM message WHERE folder = ?1", [folder])?;
+        tx.execute(
+            "UPDATE folder SET uidvalidity = ?2, modseq = NULL, complete = 0 WHERE id = ?1",
+            params![folder, uidvalidity],
+        )?;
+        tx.commit()
+    }
+
+    pub fn finish_folder(&self, folder: i64, modseq: Option<u64>) -> Result<()> {
+        self.0.execute("UPDATE folder SET modseq = ?2, complete = 1 WHERE id = ?1", params![folder, modseq])?;
+        Ok(())
+    }
+
+    pub fn uids(&self, folder: i64) -> Result<HashSet<u32>> {
+        let mut st = self.0.prepare("SELECT uid FROM message WHERE folder = ?1")?;
+        st.query_map([folder], |r| r.get(0))?.collect()
+    }
+
+    pub fn max_uid(&self, folder: i64) -> Result<u32> {
+        self.0.query_row("SELECT COALESCE(MAX(uid), 0) FROM message WHERE folder = ?1", [folder], |r| r.get(0))
+    }
+
+    /// (总数, 未读数)
+    pub fn stats(&self, folder: i64) -> Result<(u32, u32)> {
+        self.0.query_row(
+            "SELECT COUNT(*), COALESCE(SUM(flags & 1 = 0), 0) FROM message WHERE folder = ?1",
+            [folder],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+    }
+
+    /// 返回新增封数；已有的不覆盖，标记由 [`Store::set_flags`] 更新
+    pub fn put_headers(&self, folder: i64, headers: &[Header]) -> Result<usize> {
+        let tx = self.0.unchecked_transaction()?;
+        let mut n = 0;
+        {
+            let mut st = tx.prepare(
+                "INSERT OR IGNORE INTO message VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            )?;
+            for h in headers {
+                n += st.execute(params![
+                    folder, h.uid, h.flags, h.date, h.size, h.attach, h.from_name, h.from_addr, h.subject
+                ])?;
+            }
+        }
+        tx.commit()?;
+        Ok(n)
+    }
+
+    /// 用服务器的标记更新本地，有待写回改动的邮件以本地为准；返回实际变了的封数
+    pub fn set_flags(&self, folder: i64, flags: &[(u32, u8)]) -> Result<usize> {
+        let tx = self.0.unchecked_transaction()?;
+        let mut n = 0;
+        {
+            let mut st = tx.prepare(
+                "UPDATE message SET flags = ?3 WHERE folder = ?1 AND uid = ?2 AND flags <> ?3
+                 AND NOT EXISTS (SELECT 1 FROM pending WHERE folder = ?1 AND uid = ?2)",
+            )?;
+            for (uid, f) in flags {
+                n += st.execute(params![folder, uid, f])?;
+            }
+        }
+        tx.commit()?;
+        Ok(n)
+    }
+
+    /// 删掉服务器上已经没有的邮件，返回删掉的封数
+    pub fn remove(&self, folder: i64, uids: &[u32]) -> Result<usize> {
+        let tx = self.0.unchecked_transaction()?;
+        let mut n = 0;
+        for uid in uids {
+            n += tx.execute("DELETE FROM message WHERE folder = ?1 AND uid = ?2", params![folder, uid])?;
+        }
+        tx.commit()?;
+        Ok(n)
+    }
+
+    /// 最新的 `limit` 封
+    pub fn list(&self, folder: i64, limit: u32) -> Result<Vec<Header>> {
+        let mut st = self.0.prepare(
+            "SELECT uid, flags, date, size, attach, from_name, from_addr, subject FROM message
+             WHERE folder = ?1 ORDER BY date DESC LIMIT ?2",
+        )?;
+        st.query_map(params![folder, limit], |r| {
+            Ok(Header {
+                uid: r.get(0)?,
+                flags: r.get(1)?,
+                date: r.get(2)?,
+                size: r.get(3)?,
+                attach: r.get(4)?,
+                from_name: r.get(5)?,
+                from_addr: r.get(6)?,
+                subject: r.get(7)?,
+            })
+        })?
+        .collect()
+    }
+
+    /// 本地标已读 / 未读，同时记一条待写回，下次同步这个文件夹时写回服务器
+    pub fn mark_seen(&self, folder: i64, uid: u32, seen: bool) -> Result<()> {
+        let tx = self.0.unchecked_transaction()?;
+        tx.execute(
+            "UPDATE message SET flags = CASE WHEN ?3 THEN flags | 1 ELSE flags & ~1 END
+             WHERE folder = ?1 AND uid = ?2",
+            params![folder, uid, seen],
+        )?;
+        tx.execute("INSERT OR REPLACE INTO pending VALUES (?1, ?2, ?3)", params![folder, uid, seen])?;
+        tx.commit()
+    }
+
+    /// (uid, 已读)
+    pub fn pending(&self, folder: i64) -> Result<Vec<(u32, bool)>> {
+        let mut st = self.0.prepare("SELECT uid, seen FROM pending WHERE folder = ?1")?;
+        st.query_map([folder], |r| Ok((r.get(0)?, r.get(1)?)))?.collect()
+    }
+
+    /// 写回成功后删掉；写回期间又被改过的留到下次
+    pub fn clear_pending(&self, folder: i64, uids: &[u32], seen: bool) -> Result<()> {
+        let tx = self.0.unchecked_transaction()?;
+        for uid in uids {
+            tx.execute(
+                "DELETE FROM pending WHERE folder = ?1 AND uid = ?2 AND seen = ?3",
+                params![folder, uid, seen],
+            )?;
+        }
+        tx.commit()
+    }
+
+    pub fn body(&self, folder: i64, uid: u32) -> Result<Option<Vec<u8>>> {
+        self.0
+            .query_row("SELECT raw FROM body WHERE folder = ?1 AND uid = ?2", params![folder, uid], |r| r.get(0))
+            .optional()
+    }
+
+    pub fn put_body(&self, folder: i64, uid: u32, raw: &[u8]) -> Result<()> {
+        self.0.execute("INSERT OR REPLACE INTO body VALUES (?1, ?2, ?3)", params![folder, uid, raw])?;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn header(uid: u32) -> Header {
+        Header {
+            uid,
+            flags: 0,
+            date: uid as i64,
+            size: 1,
+            attach: false,
+            from_name: String::new(),
+            from_addr: String::new(),
+            subject: format!("m{uid}"),
+        }
+    }
+
+    #[test]
+    fn pending_wins_over_server_flags() {
+        let db = Store::open(":memory:").unwrap();
+        let proxy = Some("127.0.0.1:7898".to_string());
+        db.add_account(&Account { id: 0, email: "a@x".into(), host: "imap.x".into(), port: 993, proxy }).unwrap();
+        let acc = db.accounts().unwrap()[0].id;
+        db.set_proxy(acc, None).unwrap();
+        assert_eq!(db.accounts().unwrap()[0].proxy, None);
+        db.set_folders(acc, &[("INBOX".into(), Some("inbox"))]).unwrap();
+        let f = db.folders(acc).unwrap()[0].id;
+        assert_eq!(db.put_headers(f, &[header(1), header(2)]).unwrap(), 2);
+        assert_eq!(db.put_headers(f, &[header(2), header(3)]).unwrap(), 1);
+
+        db.mark_seen(f, 1, true).unwrap();
+        // 服务器还是未读：待写回的 1 不被覆盖，2 照常更新
+        assert_eq!(db.set_flags(f, &[(1, 0), (2, SEEN | FLAGGED)]).unwrap(), 1);
+        assert_eq!(db.stats(f).unwrap(), (3, 1));
+        db.clear_pending(f, &[1], false).unwrap();
+        assert_eq!(db.pending(f).unwrap(), [(1, true)]);
+
+        // 删邮件连带待写回和正文
+        db.put_body(f, 1, b"raw").unwrap();
+        assert_eq!(db.remove(f, &[1, 9]).unwrap(), 1);
+        assert!(db.pending(f).unwrap().is_empty() && db.body(f, 1).unwrap().is_none());
+
+        db.reset_folder(f, 7).unwrap();
+        assert_eq!(db.max_uid(f).unwrap(), 0);
+        db.set_folders(acc, &[]).unwrap();
+        assert!(db.folders(acc).unwrap().is_empty());
+    }
+}

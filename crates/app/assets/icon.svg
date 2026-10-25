@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256">
+  <!-- 应用图标（40px 及以上）：粉色信封，白色封口，封口尖上一枚带锁孔的白色封蜡 -->
+  <defs>
+    <linearGradient id="bg" gradientUnits="userSpaceOnUse" x1="16" y1="48" x2="240" y2="208">
+      <stop offset="0" stop-color="#F98CC8"/>
+      <stop offset="0.55" stop-color="#EC4899"/>
+      <stop offset="1" stop-color="#C21F72"/>
+    </linearGradient>
+  </defs>
+  <rect x="16" y="50" width="224" height="156" rx="30" fill="url(#bg)"/>
+  <path d="M48 84 L128 146 L208 84" fill="none" stroke="#fff" stroke-width="18" stroke-linecap="round" stroke-linejoin="round"/>
+  <circle cx="128" cy="146" r="30" fill="#fff"/>
+  <path d="M128 132 V150" stroke="#D02A80" stroke-width="10" stroke-linecap="round"/>
+  <circle cx="128" cy="134" r="9" fill="#D02A80"/>
+</svg>

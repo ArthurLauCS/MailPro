@@ -1,0 +1,3 @@
+# VC 运行库静态链接，UCRT 仍动态（Windows 自带）：没装 VC++ 运行库的电脑也能直接运行
+[target.'cfg(all(windows, target_env = "msvc"))']
+rustflags = ["-C", "target-feature=+crt-static", "-C", "link-arg=/NODEFAULTLIB:libucrt.lib", "-C", "link-arg=/DEFAULTLIB:ucrt.lib"]
