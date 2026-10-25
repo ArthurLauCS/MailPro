@@ -1,0 +1,20 @@
+[package]
+name = "mailpro-core"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[dependencies]
+ammonia = "4.2"
+async-imap = { version = "0.12", default-features = false, features = ["runtime-tokio"] }
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+futures = "0.3"
+# full_encoding：GBK / gb2312 / Big5 等非 UTF-8 字符集，中文邮件常见
+mail-parser = { version = "1.0", features = ["full_encoding"] }
+regex = "1"
+rusqlite = { version = "0.41", features = ["bundled", "fallible_uint"] }
+tokio = { version = "1", features = ["rt", "net", "time", "io-util"] }
+tokio-native-tls = "0.3"
+tokio-socks = "0.5"
+url = "2"
+windows = { version = "0.62", features = ["Win32_Security_Credentials", "Win32_System_Console"] }
