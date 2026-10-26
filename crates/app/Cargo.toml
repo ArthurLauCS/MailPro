@@ -1,6 +1,6 @@
 [package]
 name = "mailpro"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 license = "MIT"
 
@@ -18,4 +18,4 @@ webview2-com = "0.39"
 
 [dependencies.windows]
 version = "0.62"
-features = ["Win32_Foundation", "Win32_Globalization", "Win32_Graphics_Dwm", "Win32_System_Com", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"]
+features = ["Win32_Foundation", "Win32_Globalization", "Win32_Graphics_Dwm", "Win32_System_Com", "Win32_System_LibraryLoader", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"]

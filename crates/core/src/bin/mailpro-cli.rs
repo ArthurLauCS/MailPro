@@ -1,21 +1,23 @@
 //! 第二步的验证工具：添加账号、同步、看列表、标已读、挂着 IDLE 看变化；界面在第三步。
 
 use chrono::{DateTime, Local};
-use mailpro_core::cred;
+use mailpro_core::auth::{self, Secret};
 use mailpro_core::imap::{self, Event, Result, folder_name};
+use mailpro_core::smtp;
 use mailpro_core::store::{self, Account, Folder, Store};
 use std::io::{self, Write};
 use std::process::ExitCode;
 
 const USAGE: &str = "用法：
-  mailpro-cli add <邮箱> [服务器 [端口]]          Gmail 自动填服务器；然后输入密码（不回显）和代理
+  mailpro-cli add <邮箱> [服务器 [端口]]          Gmail、Outlook 自动填服务器；然后输入代理和密码（不回显），
+                                                  Outlook 不输密码，在系统默认浏览器里登录
   mailpro-cli proxy <邮箱> [主机:端口]             设 SOCKS5 代理，不带地址则改回直连
   mailpro-cli sync                                同步全部账号
   mailpro-cli list <邮箱> [文件夹]                 不带文件夹列出文件夹，带则列出最新 50 封
   mailpro-cli read|unread <邮箱> <文件夹> <uid>    标已读 / 未读并写回服务器，连不上则下次同步时写回
   mailpro-cli save <邮箱> <文件夹> <uid> <文件>    下载原始邮件存成 .eml
   mailpro-cli watch                                保持同步，打印每次变化
-数据库在 %LOCALAPPDATA%\\MailPro\\mail.db，密码在 Windows 凭据管理器。";
+数据库在 %LOCALAPPDATA%\\MailPro\\mail.db，密码和 Outlook 的令牌在 Windows 凭据管理器。";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -36,7 +38,7 @@ async fn run(args: Vec<&str>) -> Result<()> {
         ["proxy", email, ref proxy @ ..] if proxy.len() < 2 => db.set_proxy(account(&db, email)?.id, proxy.first().copied())?,
         ["sync"] => {
             for acc in db.accounts()? {
-                let mut s = imap::connect(&acc, &cred::load(&acc.email)?).await?;
+                let mut s = imap::connect(&acc, &Secret::load(&acc.email)?).await?;
                 imap::sync_all(&mut s, &db, &acc, &mut print(&acc.email)).await?;
             }
         }
@@ -58,20 +60,20 @@ async fn run(args: Vec<&str>) -> Result<()> {
         [op @ ("read" | "unread"), email, folder, uid] => {
             let (acc, f) = folder_of(&db, email, folder)?;
             db.mark(f.id, &[uid.parse()?], store::SEEN, op == "read")?;
-            match imap::connect(&acc, &cred::load(&acc.email)?).await {
+            match imap::connect(&acc, &Secret::load(&acc.email)?).await {
                 Ok(mut s) => drop(imap::sync_folder(&mut s, &db, &f).await?),
                 Err(e) => println!("连不上（{e}），已记下，下次同步时写回"),
             }
         }
         ["save", email, folder, uid, file] => {
             let (acc, f) = folder_of(&db, email, folder)?;
-            let mut s = imap::connect(&acc, &cred::load(&acc.email)?).await?;
-            let raw = imap::fetch_body(&mut s, &db, &f, uid.parse()?).await?.ok_or("服务器上没有这封")?;
+            let mut s = imap::connect(&acc, &Secret::load(&acc.email)?).await?;
+            let raw =imap::fetch_body(&mut s, &db, &f, uid.parse()?).await?.ok_or("服务器上没有这封")?;
             std::fs::write(file, raw)?;
         }
         ["watch"] => {
             let accounts = db.accounts()?;
-            let secrets = accounts.iter().map(|a| cred::load(&a.email)).collect::<std::result::Result<Vec<_>, _>>()?;
+            let secrets = accounts.iter().map(|a| Secret::load(&a.email)).collect::<Result<Vec<_>>>()?;
             let watches = accounts.iter().zip(&secrets).map(|(a, s)| imap::watch(&db, a, s, print(&a.email)));
             futures::future::join_all(watches).await;
         }
@@ -81,20 +83,29 @@ async fn run(args: Vec<&str>) -> Result<()> {
 }
 
 async fn add(db: &Store, email: &str, rest: &[&str]) -> Result<()> {
-    if imap::oauth_only(email) {
-        return Err("Outlook / Hotmail 只能用 OAuth 登录，等有了 client ID 再支持".into());
-    }
-    let host = rest.first().copied().or(imap::default_host(email)).ok_or("这个邮箱要写上 IMAP 服务器地址")?;
+    let preset = imap::preset(email);
+    let host = rest.first().copied().or(preset.map(|p| p.0)).ok_or("这个邮箱要写上 IMAP 服务器地址")?;
     let port = rest.get(1).map_or(Ok(993), |p| p.parse())?;
-    let secret = imap::tidy_secret(host, &prompt_hidden("密码：")?);
     print!("SOCKS5 代理（如 127.0.0.1:7898，直连留空）：");
     io::stdout().flush()?;
     let mut proxy = String::new();
     io::stdin().read_line(&mut proxy)?;
     let proxy = Some(proxy.trim().to_string()).filter(|p| !p.is_empty());
-    let acc = Account { id: 0, email: email.into(), host: host.into(), port, proxy };
+    let (smtp_host, smtp_port) = preset.map_or_else(|| (smtp::default_host(host), 465), |p| (p.1.into(), p.2));
+    let acc = Account { email: email.into(), host: host.into(), port, proxy, smtp_host, smtp_port, ..Default::default() };
+    let secret = if imap::oauth_only(email) {
+        // 只等 5 分钟；授权地址交给系统默认浏览器，打不开时照着打印的地址手动打开
+        let open = |url: String| {
+            println!("在浏览器里登录 {email}：\n{url}");
+            let _ = std::process::Command::new("rundll32").args(["url.dll,FileProtocolHandler", &url]).spawn();
+        };
+        let login = auth::sign_in(email, acc.proxy.as_deref(), open);
+        tokio::time::timeout(std::time::Duration::from_secs(5 * 60), login).await.map_err(|_| "登录超时")??
+    } else {
+        Secret::Password(imap::tidy_secret(host, &prompt_hidden("密码：")?))
+    };
     imap::connect(&acc, &secret).await?.logout().await?;
-    cred::save(email, &secret)?;
+    secret.save(email).await?;
     db.add_account(&acc)?;
     println!("已添加 {email}，运行 sync 开始同步");
     Ok(())
@@ -131,6 +142,7 @@ fn print(email: &str) -> impl FnMut(Event) + '_ {
                 println!("{now} {email} {}：新 {}，标记变 {}，删 {}", folder_name(&f.name), c.new, c.flags, c.gone)
             }
             Event::Error(e) => eprintln!("{now} {email} 断开：{e}"),
+            Event::Expired(e) => eprintln!("{now} {email} 授权失效，停止同步，重新 add 登录：{e}"),
         }
     }
 }

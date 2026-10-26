@@ -1,9 +1,12 @@
 //! 主窗口三栏：账号和文件夹 / 邮件列表 / 阅读区，栏宽可拖。
 //! 同步在后台引擎（[`engine`]）里跑，这里读数据库、发命令、按引擎的事件刷新。
 
+mod compose;
+
 use crate::i18n::{EN, Lang, ROLES, T, ZH, t};
 use crate::theme::{self, DISPLAY, PROSE, R_MD};
-use crate::{browser, webview};
+use crate::{browser, tray, webview};
+use compose::{Compose, Respond};
 use chrono::{DateTime, Datelike, Local};
 use futures::StreamExt;
 use futures::channel::mpsc::UnboundedSender;
@@ -28,10 +31,11 @@ use mailpro_core::engine::{self, BodyError, Cmd, Event};
 use mailpro_core::imap::{self, folder_name};
 use mailpro_core::link::{self, Link};
 use mailpro_core::message::Message;
+use mailpro_core::smtp::{self, Mail};
 use mailpro_core::store::{self, Account, Folder, Header, Store};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use std::cell::Cell;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::rc::Rc;
 use std::time::Duration;
@@ -51,6 +55,8 @@ struct Acct {
     latest: i64,
     /// 连接断开的原因，重新连上后清掉
     error: Option<String>,
+    /// Outlook 授权失效，停止同步，要重新登录；error 同时置上
+    expired: bool,
 }
 
 /// 拖动中的账号，跟着鼠标画一个强调色的小条
@@ -138,12 +144,15 @@ struct AdsDlg {
 
 /// 添加账号 / 账号设置对话框的内容
 struct Form {
-    /// 账号设置时为该账号，只改代理
+    /// 账号设置时为该账号，改代理、发信名字和发信服务器
     account: Option<Account>,
     email: Entity<InputState>,
     secret: Entity<InputState>,
     host: Entity<InputState>,
     port: Entity<InputState>,
+    smtp_host: Entity<InputState>,
+    smtp_port: Entity<InputState>,
+    name: Entity<InputState>,
     proxy: Entity<InputState>,
     busy: bool,
     error: Option<String>,
@@ -186,12 +195,22 @@ pub struct MailPro {
     /// 每次显示新邮件加一，让 WebView2 重新加载
     seq: u32,
     form: Option<Entity<Form>>,
+    compose: Option<Entity<Compose>>,
+    /// 点开的草稿（文件夹 id，uid），正文到了就接着写
+    edit: Option<(i64, u32)>,
     /// 打开链接用的浏览器，格式见 [`browser`]
     browser: String,
     /// 左栏收起的账号 id，存在设置 `collapsed` 里（空格分隔），重启后保持
     collapsed: HashSet<i64>,
     /// 等到最早一个账号该熄灭泛光时重画
     glow: Task<()>,
+    tray: tray::Tray,
+    /// 收件箱 id →（这时刻起收到的才弹新信通知，已经看过的最大 uid），见 [`MailPro::notify_new`]
+    fresh: HashMap<i64, (i64, u32)>,
+    /// 最近一条通知点开后去哪：（账号，收件箱，只有一封时它的 uid）
+    notice: Option<(i64, i64, Option<u32>)>,
+    /// 点通知要打开的那封（文件夹 id，uid），列表读好后打开
+    goto: Option<(i64, u32)>,
 }
 
 impl MailPro {
@@ -217,6 +236,21 @@ impl MailPro {
             }
         })
         .detach();
+        let (tx, mut rx) = futures::channel::mpsc::unbounded();
+        let tray = tray::Tray::new(&path, t(cx), tx);
+        cx.spawn_in(window, async move |this, cx| {
+            while let Some(e) = rx.next().await {
+                if this.update_in(cx, |v, window, cx| v.on_tray(e, window, cx)).is_err() {
+                    break;
+                }
+            }
+        })
+        .detach();
+        // 关窗口只是藏起来，继续收信；从托盘菜单退出
+        window.on_window_should_close(cx, |window, _| {
+            tray::hide(hwnd(window));
+            false
+        });
 
         let current = webview::Current::default();
         let reading = eml.map(|m| {
@@ -258,9 +292,15 @@ impl MailPro {
             placed: Rc::default(),
             seq: 0,
             form: None,
+            compose: None,
+            edit: None,
             browser,
             collapsed,
             glow: Task::ready(()),
+            tray,
+            fresh: HashMap::new(),
+            notice: None,
+            goto: None,
         };
         v.viewer(window, cx);
         v.reload_accounts();
@@ -275,14 +315,13 @@ impl MailPro {
             let _ = unsafe { c.Close() };
         }
         self.placed.set(None);
-        let RawWindowHandle::Win32(h) = window.window_handle().expect("window handle").as_raw() else { unreachable!() };
         let bg = cx.theme().is_dark().then(|| {
             let c = cx.theme().background.to_rgb();
             let u = |v: f32| (v * 255.).round() as u8;
             COREWEBVIEW2_COLOR { A: 255, R: u(c.r), G: u(c.g), B: u(c.b) }
         });
         let (tx, mut rx) = futures::channel::mpsc::unbounded();
-        webview::create(HWND(h.hwnd.get() as _), self.current.clone(), tx, bg).expect("WebView2");
+        webview::create(hwnd(window), self.current.clone(), tx, bg).expect("WebView2");
         self.web_events = cx.spawn_in(window, async move |this, cx| {
             while let Some(e) = rx.next().await {
                 if this.update_in(cx, |v, window, cx| v.on_webview(e, window, cx)).is_err() {
@@ -299,9 +338,9 @@ impl MailPro {
         let mut accounts = self.db.accounts().unwrap_or_default();
         accounts.sort_by_key(|a| order.iter().position(|&id| id == a.id).unwrap_or(usize::MAX));
         for acc in accounts {
-            let error = old.iter().find(|a| a.acc.id == acc.id).and_then(|a| a.error.clone());
+            let (error, expired) = old.iter().find(|a| a.acc.id == acc.id).map_or((None, false), |a| (a.error.clone(), a.expired));
             let id = acc.id;
-            self.accounts.push(Acct { acc, folders: Vec::new(), latest: 0, error });
+            self.accounts.push(Acct { acc, folders: Vec::new(), latest: 0, error, expired });
             self.reload_folders(id);
         }
     }
@@ -311,7 +350,14 @@ impl MailPro {
         let Some(a) = self.accounts.iter_mut().find(|a| a.acc.id == account) else { return };
         let folders = db.folders(account).unwrap_or_default();
         a.folders = folders.into_iter().map(|f| (db.stats(f.id).map_or(0, |s| s.1), f)).map(|(n, f)| (f, n)).collect();
-        a.latest = a.folders.iter().find(|f| f.0.role.as_deref() == Some("inbox")).map_or(0, |f| db.latest(f.0.id).unwrap_or(0));
+        let inbox = a.folders.iter().find(|f| f.0.role.as_deref() == Some("inbox")).map(|f| f.0.id);
+        a.latest = inbox.map_or(0, |id| db.latest(id).unwrap_or(0));
+        // 收件箱从第一次读到它起（启动时，或新加的账号列出文件夹时）收到的新信才弹通知
+        if let Some(id) = inbox {
+            self.fresh.entry(id).or_insert_with(|| (Local::now().timestamp(), db.max_uid(id).unwrap_or(0)));
+        }
+        let inboxes = self.accounts.iter().flat_map(|a| &a.folders).filter(|f| f.0.role.as_deref() == Some("inbox"));
+        self.tray.unread(inboxes.map(|f| f.1).sum());
     }
 
     /// 把账号 `from` 挪到 `to` 的位置：往下拖落在它后面，往上拖落在它前面
@@ -385,6 +431,9 @@ impl MailPro {
                         let shown: HashSet<u32> = v.headers.iter().filter(|h| h.folder == v.picked_in.1).map(|h| h.uid).collect();
                         v.picked.retain(|u| shown.contains(u));
                     }
+                    if let Some((f, uid)) = v.goto.take_if(|g| g.0 == folder) {
+                        v.click(f, uid, Modifiers::default(), cx);
+                    }
                     cx.notify();
                 }
             });
@@ -442,10 +491,10 @@ impl MailPro {
         cx.notify();
     }
 
-    /// 点一行：直接点选中并打开这封；Ctrl 点增减一封、Shift 点从上次点的那封选到这封，都不打开。
+    /// 点一行：直接点选中并打开这封，是草稿就接着写；Ctrl 点增减一封、Shift 点从上次点的那封选到这封，都不打开。
     /// 只能在同一个文件夹里多选，点了别的文件夹的邮件就从它重新选起
     fn click(&mut self, folder: i64, uid: u32, m: Modifiers, cx: &mut Context<Self>) {
-        let Some(account) = self.locate(folder).map(|(a, _)| a.acc.id) else { return };
+        let Some((account, drafts)) = self.locate(folder).map(|(a, f)| (a.acc.id, f.role.as_deref() == Some("drafts"))) else { return };
         if self.picked_in != (account, folder) {
             (self.picked, self.anchor, self.picked_in) = (HashSet::new(), None, (account, folder));
         }
@@ -461,6 +510,7 @@ impl MailPro {
             self.anchor = Some(uid);
         } else {
             (self.picked, self.anchor) = (HashSet::from([uid]), Some(uid));
+            self.edit = drafts.then_some((folder, uid));
             return self.open(account, folder, uid, cx);
         }
         self.reading = None;
@@ -543,22 +593,30 @@ impl MailPro {
         }
     }
 
-    /// 把选中的邮件移到 `to`，None 为彻底删除：先从本地删掉，再让引擎在服务器上移。账号没连上时不动
+    /// 把选中的邮件移到 `to`，None 为彻底删除
     fn move_picked(&mut self, to: Option<Folder>, window: &mut Window, cx: &mut Context<Self>) {
-        let (account, folder) = self.picked_in;
+        let uids = self.headers.iter().filter(|h| self.is_picked(h)).map(|h| h.uid).collect();
+        self.move_uids(self.picked_in, uids, to, window, cx);
+    }
+
+    /// 把文件夹里的这些邮件移到 `to`，None 为彻底删除：先从本地删掉，再让引擎在服务器上移。账号没连上时不动
+    fn move_uids(&mut self, (account, folder): (i64, i64), uids: Vec<u32>, to: Option<Folder>, window: &mut Window, cx: &mut Context<Self>) {
         let Some(f) = self.folder(account, folder) else { return };
         if self.accounts.iter().any(|a| a.acc.id == account && a.error.is_some()) {
             return window.push_notification(Notification::error(t(cx).offline), cx);
         }
-        let uids: Vec<u32> = self.headers.iter().filter(|h| self.is_picked(h)).map(|h| h.uid).collect();
         if uids.is_empty() || self.db.remove(folder, &uids).is_err() {
             return;
         }
-        self.headers.retain(|h| h.folder != folder || !self.picked.contains(&h.uid));
-        if self.reading.as_ref().is_some_and(|r| r.folder == folder && self.picked.contains(&r.uid)) {
+        let gone: HashSet<u32> = uids.iter().copied().collect();
+        self.headers.retain(|h| h.folder != folder || !gone.contains(&h.uid));
+        if self.reading.as_ref().is_some_and(|r| r.folder == folder && gone.contains(&r.uid)) {
             self.reading = None;
         }
-        (self.picked, self.anchor) = (HashSet::new(), None);
+        if self.picked_in.1 == folder {
+            self.picked.retain(|u| !gone.contains(u));
+            self.anchor = self.anchor.filter(|u| !gone.contains(u));
+        }
         let _ = self.cmd.unbounded_send(Cmd::Move { account, folder: f, uids, to });
         self.reload_folders(account);
         cx.notify();
@@ -566,10 +624,21 @@ impl MailPro {
 
     /// 阅读区的操作栏
     fn actions(&self, cx: &mut Context<Self>) -> AnyElement {
-        let buttons = self.acts(t(cx)).into_iter().map(|(act, icon, tip)| {
+        let (t, border) = (t(cx), cx.theme().border);
+        // 回复、转发要原信，正文到了才给
+        let respond = self.reading.as_ref().filter(|r| r.account != 0 && matches!(r.body, Body::Shown)).map(|_| {
+            [(Respond::Reply, IconName::Reply, t.reply), (Respond::ReplyAll, IconName::ReplyAll, t.reply_all), (Respond::Forward, IconName::Forward, t.forward)]
+                .map(|(kind, icon, tip)| Button::new(tip).ghost().small().icon(icon).tooltip(tip).on_click(cx.listener(move |v, _, window, cx| v.respond(kind, window, cx))))
+        });
+        let buttons = self.acts(t).into_iter().map(|(act, icon, tip)| {
             Button::new(tip).ghost().small().icon(icon).tooltip(tip).on_click(cx.listener(move |v, _, window, cx| v.act(act, window, cx)))
         });
-        h_flex().flex_none().gap_1().children(buttons).into_any_element()
+        h_flex()
+            .flex_none()
+            .gap_1()
+            .when_some(respond, |d, r| d.children(r).child(div().w(px(1.)).h(px(16.)).mx_1().bg(border)))
+            .children(buttons)
+            .into_any_element()
     }
 
     fn on_engine(&mut self, e: Event, window: &mut Window, cx: &mut Context<Self>) {
@@ -577,13 +646,14 @@ impl MailPro {
         match e {
             Event::Folders(account) => {
                 if let Some(a) = self.accounts.iter_mut().find(|a| a.acc.id == account) {
-                    a.error = None;
+                    (a.error, a.expired) = (None, false);
                 }
                 self.reload_folders(account);
                 self.select_first(Some(account), cx);
             }
             Event::Changed { account, folder } => {
                 self.reload_folders(account);
+                self.notify_new(account, folder, window, t);
                 if self.mixed || self.sel == Some((account, folder)) {
                     self.load(cx);
                 }
@@ -593,8 +663,12 @@ impl MailPro {
                 match msg {
                     Ok(m) => {
                         r.shown(&m);
+                        let account = r.account;
                         *self.current.borrow_mut() = Some(m);
                         self.show();
+                        if self.edit.take_if(|e| *e == (folder, uid)).is_some() {
+                            self.edit_draft(account, folder, uid, window, cx);
+                        }
                     }
                     Err(BodyError::Gone) => r.body = Body::Failed(t.gone.into()),
                     Err(BodyError::Unparsable) => r.body = Body::Failed(t.unparsable.into()),
@@ -606,6 +680,12 @@ impl MailPro {
                 Some(a) => a.error = Some(msg),
                 None => eprintln!("{msg}"),
             },
+            Event::Expired(account) => {
+                if let Some(a) = self.accounts.iter_mut().find(|a| a.acc.id == account) {
+                    (a.error, a.expired) = (Some(String::new()), true);
+                }
+            }
+            Event::Browse(url) => self.browse(url, cx),
             Event::Added(Ok(account)) => {
                 self.reload_accounts();
                 if self.form.take().is_some() && window.has_active_dialog(cx) {
@@ -628,6 +708,47 @@ impl MailPro {
         cx.notify();
     }
 
+    /// 收件箱新到的未读信弹通知（只算 `fresh` 记的时刻起收到的），窗口在前台时不弹。
+    /// 一封显示发件人和主题，点开即打开它；多封合成一条，点开打开收件箱
+    fn notify_new(&mut self, account: i64, folder: i64, window: &Window, t: &T) {
+        let Some((since, after)) = self.fresh.get_mut(&folder) else { return };
+        let new = self.db.fresh(folder, *after, *since).unwrap_or_default();
+        let Some(top) = new.iter().map(|h| h.uid).max() else { return };
+        *after = top;
+        if window.is_window_active() {
+            return;
+        }
+        let Some(a) = self.accounts.iter().find(|a| a.acc.id == account) else { return };
+        match &new[..] {
+            [h] => {
+                let from = if h.from_name.is_empty() { &h.from_addr } else { &h.from_name };
+                self.tray.notify(from, if h.subject.is_empty() { t.no_subject } else { &h.subject });
+            }
+            _ => self.tray.notify(&a.acc.email, &t.new_mail.replace("{n}", &new.len().to_string())),
+        }
+        self.notice = Some((account, folder, (new.len() == 1).then_some(top)));
+    }
+
+    fn on_tray(&mut self, e: tray::Event, window: &mut Window, cx: &mut Context<Self>) {
+        match e {
+            tray::Event::Open => {}
+            tray::Event::Clicked => {
+                if let Some((account, folder, uid)) = self.notice {
+                    self.query.update(cx, |q, cx| q.clean(window, cx));
+                    self.goto = uid.map(|uid| (folder, uid));
+                    self.select(account, folder, cx);
+                }
+            }
+            tray::Event::Exit => {
+                self.tray.remove();
+                return cx.quit();
+            }
+            tray::Event::Readd => return self.tray.add(),
+        }
+        tray::show(hwnd(window));
+        window.activate_window();
+    }
+
     fn on_webview(&mut self, e: webview::Event, window: &mut Window, cx: &mut Context<Self>) {
         match e {
             webview::Event::Ready(c) => {
@@ -644,10 +765,15 @@ impl MailPro {
             }
             webview::Event::Link(n) => {
                 let raw = self.current.borrow().as_ref().and_then(|m| m.body.links.get(n).cloned());
-                if let Some(raw) = raw {
-                    let dlg = cx.new(|_| LinkDlg { link: link::clean(&raw), raw, busy: false, error: None });
-                    let view = cx.entity().downgrade();
-                    window.open_dialog(cx, move |dialog, _, cx| link_dialog(&dlg, &view, dialog, cx));
+                let Some(raw) = raw else { return };
+                // mailto: 链接直接写信；还没有账号时当普通链接，可以复制地址
+                match smtp::mailto(&raw).filter(|_| !self.accounts.is_empty()) {
+                    Some(mail) => self.compose(mail, window, cx),
+                    None => {
+                        let dlg = cx.new(|_| LinkDlg { link: link::clean(&raw), raw, busy: false, error: None });
+                        let view = cx.entity().downgrade();
+                        window.open_dialog(cx, move |dialog, _, cx| link_dialog(&dlg, &view, dialog, cx));
+                    }
                 }
             }
             webview::Event::Image(n, p) => self.image(n, p, cx),
@@ -727,55 +853,93 @@ impl MailPro {
 
     fn set_language(&mut self, t: &'static T, window: &mut Window, cx: &mut Context<Self>) {
         cx.set_global(Lang(t));
+        self.tray.lang(t);
         self.query.update(cx, |q, cx| q.set_placeholder(t.search, window, cx));
         let _ = self.db.set_setting("language", t.code);
         cx.refresh_windows();
     }
 
-    /// `account` 为 None 是添加账号，否则是该账号的设置（只改代理）
+    /// `account` 为 None 是添加账号，否则是该账号的设置
     fn open_form(&mut self, account: Option<Account>, window: &mut Window, cx: &mut Context<Self>) {
         let mut input = |placeholder: &str, value: &str, masked: bool| {
             let (placeholder, value) = (placeholder.to_string(), value.to_string());
             cx.new(|cx| InputState::new(window, cx).placeholder(placeholder).default_value(value).masked(masked))
         };
-        let proxy = account.as_ref().and_then(|a| a.proxy.clone()).unwrap_or_default();
+        let acc = account.clone().unwrap_or(Account { smtp_port: 465, ..Default::default() });
         let (email, secret) = (input("name@gmail.com", "", false), input("", "", true));
-        let (host, port, proxy) = (input("imap.example.com", "", false), input("", "993", false), input("127.0.0.1:7898", &proxy, false));
-        let form = cx.new(|_| Form { account, email, secret, host, port, proxy, busy: false, error: None });
+        let (host, port) = (input("imap.example.com", "", false), input("", "993", false));
+        let (smtp_host, smtp_port) = (input("smtp.example.com", &acc.smtp_host, false), input("", &acc.smtp_port.to_string(), false));
+        let (name, proxy) = (input("", &acc.name, false), input("127.0.0.1:7898", acc.proxy.as_deref().unwrap_or_default(), false));
+        let form = cx.new(|_| Form { account, email, secret, host, port, smtp_host, smtp_port, name, proxy, busy: false, error: None });
         self.form = Some(form.clone());
         let view = cx.entity().downgrade();
         window.open_dialog(cx, move |dialog, _, cx| form_dialog(&form, &view, dialog, cx));
     }
 
-    fn submit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    /// 添加账号，或保存账号设置；`relogin` 是 Outlook 账号设置里的重新登录，登录通过才连同设置一起存
+    fn submit(&mut self, relogin: bool, window: &mut Window, cx: &mut Context<Self>) {
         let Some(form) = self.form.clone() else { return };
         let t = t(cx);
         let f = form.read(cx);
         let text = |e: &Entity<InputState>| e.read(cx).value().trim().to_string();
         let (email, host, port, proxy) = (text(&f.email), text(&f.host), text(&f.port), text(&f.proxy));
+        let (name, smtp_host, smtp_port) = (text(&f.name), text(&f.smtp_host), text(&f.smtp_port).parse().unwrap_or(465));
         let secret = f.secret.read(cx).value().to_string();
         let proxy = Some(proxy).filter(|p| !p.is_empty());
+        // 发信服务器留空按收信服务器推
+        let smtp_host = |host: &str| if smtp_host.is_empty() { smtp::default_host(host) } else { smtp_host.clone() };
         if let Some(acc) = f.account.clone() {
-            // 账号设置只改代理，按新设置重连
-            let _ = self.db.set_proxy(acc.id, proxy.as_deref());
-            let _ = self.cmd.unbounded_send(Cmd::Restart(acc.id));
-            self.reload_accounts();
-            self.form = None;
-            window.close_dialog(cx);
-            return;
+            // 账号设置改代理、发信名字和发信服务器，按新设置重连
+            let acc = Account { proxy, name, smtp_host: smtp_host(&acc.host), smtp_port, ..acc };
+            if !relogin {
+                let _ = self.db.add_account(&acc);
+                let _ = self.cmd.unbounded_send(Cmd::Restart(acc.id));
+                self.reload_accounts();
+                self.form = None;
+                window.close_dialog(cx);
+                return;
+            }
+            let _ = self.cmd.unbounded_send(Cmd::Add(acc, String::new()));
+            return form.update(cx, |f, cx| {
+                (f.busy, f.error) = (true, None);
+                cx.notify();
+            });
         }
-        let host = imap::default_host(&email).map(str::to_string).or(Some(host).filter(|h| !h.is_empty()));
-        let error = match &host {
-            _ if imap::oauth_only(&email) => Some(t.oauth_only),
-            None => Some(t.need_server),
-            Some(_) => None,
-        };
-        if let (None, Some(host)) = (error, host) {
-            let acc = Account { id: 0, email, host, port: port.parse().unwrap_or(993), proxy };
+        // Gmail、Outlook 的收信、发信服务器都是固定的
+        let preset = imap::preset(&email);
+        let host = preset.map(|p| p.0.to_string()).or(Some(host).filter(|h| !h.is_empty()));
+        let error = host.is_none().then_some(t.need_server);
+        if let Some(host) = host {
+            let (smtp_host, smtp_port) = preset.map_or_else(|| (smtp_host(&host), smtp_port), |p| (p.1.into(), p.2));
+            let acc = Account { id: 0, email, smtp_host, smtp_port, host, port: port.parse().unwrap_or(993), proxy, name };
             let _ = self.cmd.unbounded_send(Cmd::Add(acc, secret));
         }
         form.update(cx, |f, cx| {
             (f.busy, f.error) = (error.is_none(), error.map(Into::into));
+            cx.notify();
+        });
+    }
+
+    /// Outlook 登录：按“浏览器”菜单打开授权地址，登录页的网络即该浏览器（AdsPower 环境）的网络
+    fn browse(&mut self, url: String, cx: &mut Context<Self>) {
+        let Some(id) = browser::adspower(&self.browser).map(str::to_string) else {
+            return self.browse_failed(browser::open(&url, &self.browser), cx);
+        };
+        // AdsPower 可能要先启动环境，放到后台等
+        let task = cx.background_spawn(async move { browser::open_adspower(&url, &id) });
+        cx.spawn(async move |this, cx| {
+            let r = task.await;
+            let _ = this.update(cx, |v, cx| v.browse_failed(r, cx));
+        })
+        .detach();
+    }
+
+    /// 浏览器打不开就放弃这次登录，原因显示在对话框里
+    fn browse_failed(&mut self, r: Result<(), String>, cx: &mut Context<Self>) {
+        let (Err(e), Some(form)) = (r, &self.form) else { return };
+        let _ = self.cmd.unbounded_send(Cmd::Cancel);
+        form.update(cx, |f, cx| {
+            (f.busy, f.error) = (false, Some(format!("{}{e}", t(cx).open_failed)));
             cx.notify();
         });
     }
@@ -861,7 +1025,8 @@ impl MailPro {
                 .on_drop(cx.listener(move |v, d: &DraggedAccount, _, cx| v.move_account(d.id, id, cx)))
                 .child(head)
                 .when(!collapsed, |d| {
-                    d.when_some(a.error.clone(), |d, e| d.child(div().pl(px(30.)).pr_2().text_xs().text_color(theme.danger).child(format!("{}{e}", t.disconnected))))
+                    let error = a.error.as_ref().map(|e| if a.expired { t.expired.to_string() } else { format!("{}{e}", t.disconnected) });
+                    d.when_some(error, |d, e| d.child(div().pl(px(30.)).pr_2().text_xs().text_color(theme.danger).child(e)))
                         .children(folders)
                 })
         });
@@ -975,10 +1140,15 @@ impl MailPro {
                     .when(h.flags & store::FLAGGED != 0, |d| d.child(Icon::new(IconName::StarFill).xsmall().text_color(theme.warning))),
             )
             .on_click(cx.listener(move |v, e: &ClickEvent, _, cx| v.click(folder, uid, e.modifiers(), cx)))
-            // 右键没选中的行先选中它；菜单下一帧才建，那时已选好
+            // 右键没选中的行先选中它，是草稿也不接着写；菜单下一帧才建，那时已选好
             .on_mouse_down(
                 MouseButton::Right,
-                cx.listener(move |v, _, _, cx| if !(v.picked_in.1 == folder && v.picked.contains(&uid)) { v.click(folder, uid, Modifiers::none(), cx) }),
+                cx.listener(move |v, _, _, cx| {
+                    if !(v.picked_in.1 == folder && v.picked.contains(&uid)) {
+                        v.click(folder, uid, Modifiers::none(), cx);
+                        v.edit = None;
+                    }
+                }),
             )
             .context_menu(move |menu, _, cx| {
                 let Some(view) = view.upgrade() else { return menu };
@@ -1026,6 +1196,12 @@ impl MailPro {
                 v.scroll.scroll_to_item(0, ScrollStrategy::Top);
                 v.load(cx);
             }));
+        let compose = Button::new("compose")
+            .ghost()
+            .small()
+            .icon(IconName::SquarePen)
+            .tooltip(t(cx).compose)
+            .on_click(cx.listener(|v, _, window, cx| v.compose(Mail::default(), window, cx)));
         let (t, theme) = (t(cx), cx.theme());
         let search = h_flex()
             .flex_none()
@@ -1034,6 +1210,7 @@ impl MailPro {
             .gap_1()
             .border_b_1()
             .border_color(theme.border)
+            .child(compose)
             .child(Input::new(&self.query).small().flex_1().prefix(Icon::new(IconName::Search).small()).cleanable(true))
             .child(scope);
         let empty = self.headers.is_empty() && self.sel.is_some();
@@ -1332,20 +1509,36 @@ fn form_dialog(form: &Entity<Form>, view: &WeakEntity<MailPro>, dialog: Dialog, 
     let (t, theme) = (t(cx), cx.theme());
     let f = form.read(cx);
     let settings = f.account.is_some();
-    let email = f.email.read(cx).value();
-    let need_host = !settings && imap::default_host(&email).is_none();
-    let password = if imap::default_host(&email).is_some() { t.app_password } else { t.password };
+    let email = f.account.as_ref().map_or_else(|| f.email.read(cx).value(), |a| a.email.clone().into());
+    // Gmail、Outlook 的收信、发信服务器都是固定的；Outlook 不用密码，在浏览器里登录
+    let (preset, oauth) = (imap::preset(&email).is_some(), imap::oauth_only(&email));
+    let password = if preset { t.app_password } else { t.password };
     let direct = f.proxy.read(cx).value().trim().is_empty();
     let field = |label: &'static str, input: &Entity<InputState>| v_flex().gap_1().child(div().text_sm().child(label)).child(Input::new(input));
-    let view = view.clone();
+    let busy = |label| if !f.busy { label } else if oauth { t.waiting_browser } else { t.signing_in };
+    let submit = |relogin| {
+        let view = view.clone();
+        move |_: &ClickEvent, window: &mut Window, cx: &mut App| drop(view.update(cx, |v, cx| v.submit(relogin, window, cx)))
+    };
+    // 关掉对话框即放弃正在进行的 Outlook 浏览器登录，回环监听随之关闭
+    let cancel = {
+        let view = view.clone();
+        move |cx: &mut App| drop(view.update(cx, |v, _| drop(v.cmd.unbounded_send(Cmd::Cancel))))
+    };
+    let on_close = cancel.clone();
     dialog
         .title(title(if settings { t.account_settings } else { t.add_account }))
         .w(px(440.))
+        .on_close(move |_, _, cx| on_close(cx))
         .child(
             v_flex()
                 .gap_3()
-                .when(!settings, |d| d.child(field(t.email, &f.email)).child(field(password, &f.secret)))
-                .when(need_host, |d| d.child(h_flex().gap_2().child(field(t.server, &f.host).flex_1()).child(field(t.port, &f.port).w(px(90.)))))
+                .when(!settings, |d| d.child(field(t.email, &f.email)))
+                .when(!settings && oauth, |d| d.child(div().font_family(PROSE).text_sm().text_color(theme.muted_foreground).child(t.outlook_hint)))
+                .when(!settings && !oauth, |d| d.child(field(password, &f.secret)))
+                .when(!settings && !preset, |d| d.child(h_flex().gap_2().child(field(t.server, &f.host).flex_1()).child(field(t.port, &f.port).w(px(90.)))))
+                .when(!preset, |d| d.child(h_flex().gap_2().child(field(t.smtp_server, &f.smtp_host).flex_1()).child(field(t.port, &f.smtp_port).w(px(90.)))))
+                .child(field(t.sender_name, &f.name))
                 .child(field(t.proxy, &f.proxy))
                 .when(direct, |d| d.child(div().font_family(PROSE).text_sm().text_color(theme.warning).child(t.direct_warning)))
                 .when_some(f.error.clone(), |d, e| d.child(div().text_xs().text_color(theme.danger).child(e))),
@@ -1354,20 +1547,21 @@ fn form_dialog(form: &Entity<Form>, view: &WeakEntity<MailPro>, dialog: Dialog, 
             h_flex()
                 .justify_end()
                 .gap_2()
-                .child(Button::new("cancel").label(t.cancel).on_click(|_, window, cx| window.close_dialog(cx)))
+                .child(Button::new("cancel").label(t.cancel).on_click(move |_, window, cx| {
+                    cancel(cx);
+                    window.close_dialog(cx)
+                }))
+                .when(settings && oauth, |d| d.child(Button::new("relogin").label(busy(t.relogin)).disabled(f.busy).on_click(submit(true))))
                 .child(
                     Button::new("ok")
                         .primary()
-                        .label(if f.busy { t.signing_in } else if settings { t.save } else { t.add })
+                        .label(if settings { t.save } else { busy(if oauth { t.sign_in } else { t.add }) })
                         .disabled(f.busy)
-                        .on_click(move |_, window, cx| {
-                            let _ = view.update(cx, |v, cx| v.submit(window, cx));
-                        }),
+                        .on_click(submit(false)),
                 ),
         )
 }
 
-/// 对话框标题：衬线粗体
 /// 彻底删除选中的 `n` 封前确认
 fn delete_dialog(n: usize, view: &WeakEntity<MailPro>, dialog: Dialog, cx: &mut App) -> Dialog {
     let (t, theme) = (t(cx), cx.theme());
@@ -1416,6 +1610,12 @@ fn move_dialog(folders: &[Folder], view: &WeakEntity<MailPro>, dialog: Dialog, c
             })
     });
     dialog.title(title(t.move_to.trim_end_matches('…'))).w(px(360.)).child(v_flex().id("folders").max_h(px(420.)).overflow_y_scroll().children(rows))
+}
+
+/// 对话框标题：衬线粗体
+fn hwnd(window: &Window) -> HWND {
+    let RawWindowHandle::Win32(h) = HasWindowHandle::window_handle(window).expect("window handle").as_raw() else { unreachable!() };
+    HWND(h.hwnd.get() as _)
 }
 
 fn title(s: &str) -> impl IntoElement {
