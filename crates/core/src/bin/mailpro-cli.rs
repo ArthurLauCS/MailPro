@@ -57,7 +57,7 @@ async fn run(args: Vec<&str>) -> Result<()> {
         }
         [op @ ("read" | "unread"), email, folder, uid] => {
             let (acc, f) = folder_of(&db, email, folder)?;
-            db.mark_seen(f.id, uid.parse()?, op == "read")?;
+            db.mark(f.id, &[uid.parse()?], store::SEEN, op == "read")?;
             match imap::connect(&acc, &cred::load(&acc.email)?).await {
                 Ok(mut s) => drop(imap::sync_folder(&mut s, &db, &f).await?),
                 Err(e) => println!("连不上（{e}），已记下，下次同步时写回"),

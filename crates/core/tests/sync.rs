@@ -1,4 +1,5 @@
-//! 对着本地 IMAP 测试服务器走一遍同步：首次拉取、写回已读、另一端改标记 / 删信 / 来新信后再同步、下载正文、IDLE 实时收新信。
+//! 对着本地 IMAP 测试服务器走一遍同步：首次拉取、写回已读和星标、另一端改标记 / 删信 / 来新信后再同步、下载正文、
+//! 移动和彻底删除、IDLE 实时收新信。
 //! 默认跳过。跑法（GreenMail，明文 IMAP 端口 3143，一次一跑，跑完重启服务器清空邮箱）：
 //!   java -Dgreenmail.setup.test.imap -Dgreenmail.users=t:p@localhost -jar greenmail-standalone.jar
 //!   MAILPRO_TEST_IMAP=127.0.0.1:3143 cargo test -p mailpro-core --test sync -- --ignored
@@ -6,7 +7,7 @@
 use futures::TryStreamExt;
 use futures::future::{Either, select};
 use mailpro_core::imap::{self, Changes, Event, Session};
-use mailpro_core::store::{Account, SEEN, Store};
+use mailpro_core::store::{Account, FLAGGED, SEEN, Store};
 use std::time::Duration;
 use tokio::net::TcpStream;
 use tokio::time::sleep;
@@ -21,9 +22,11 @@ fn mail(i: u32) -> String {
     }
 }
 
-async fn seen_on_server(s: &mut Session<TcpStream>, uid: u32) -> bool {
+/// 服务器上这封的（已读，星标）
+async fn on_server(s: &mut Session<TcpStream>, uid: u32) -> (bool, bool) {
+    use async_imap::types::Flag;
     let f: Vec<_> = s.uid_fetch(uid.to_string(), "FLAGS").await.unwrap().try_collect().await.unwrap();
-    f[0].flags().any(|f| matches!(f, async_imap::types::Flag::Seen))
+    (f[0].flags().any(|f| matches!(f, Flag::Seen)), f[0].flags().any(|f| matches!(f, Flag::Flagged)))
 }
 
 #[test]
@@ -53,11 +56,12 @@ fn syncs_against_server() {
         assert!(list.iter().all(|h| h.from_name == "测试" && h.subject.starts_with("测试 ") && h.flags == 0));
         assert_eq!(list.iter().filter(|h| h.attach).map(|h| h.uid).collect::<Vec<_>>(), [3]);
 
-        // 本地标已读，同步时写回服务器
-        db.mark_seen(inbox().id, 1, true).unwrap();
+        // 本地标已读、加星，同步时写回服务器
+        db.mark(inbox().id, &[1], SEEN, true).unwrap();
+        db.mark(inbox().id, &[1], FLAGGED, true).unwrap();
         assert_eq!(imap::sync_folder(&mut me, &db, &inbox()).await.unwrap(), Changes::default());
         web.select("INBOX").await.unwrap();
-        assert!(seen_on_server(&mut web, 1).await);
+        assert_eq!(on_server(&mut web, 1).await, (true, true));
         assert!(db.pending(inbox().id).unwrap().is_empty());
 
         // 另一端：2 标已读、3 删掉、来一封新的
@@ -74,7 +78,16 @@ fn syncs_against_server() {
         let raw = imap::fetch_body(&mut me, &db, &inbox(), 4).await.unwrap().unwrap();
         assert!(raw.ends_with(b"body\r\n"));
         assert_eq!(db.body(inbox().id, 4).unwrap().unwrap(), raw);
-        assert!(!seen_on_server(&mut web, 4).await);
+        assert!(!on_server(&mut web, 4).await.0);
+
+        // 4 移到“已发送”，2 彻底删除；本地由界面先删
+        let sent = db.folders(acc.id).unwrap().remove(1);
+        db.remove(inbox().id, &[2, 4]).unwrap();
+        imap::move_to(&mut me, &inbox(), &[4], Some(&sent)).await.unwrap();
+        imap::move_to(&mut me, &inbox(), &[2], None).await.unwrap();
+        assert_eq!(web.uid_search("ALL").await.unwrap().into_iter().collect::<Vec<_>>(), [1]);
+        assert_eq!(imap::sync_folder(&mut me, &db, &sent).await.unwrap(), Changes { new: 1, ..Default::default() });
+        assert_eq!(imap::sync_folder(&mut me, &db, &inbox()).await.unwrap(), Changes::default());
 
         // IDLE：另一端来新信，本地几秒内跟上。另一端改标记靠真实账号验证：
         // GreenMail 不把其他连接改的标记推给 IDLE 中的连接

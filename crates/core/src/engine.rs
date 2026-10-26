@@ -1,5 +1,5 @@
 //! 后台同步：单独一个线程跑 tokio。每个账号两条连接：一条常驻同步（IDLE + 定时同步），
-//! 一条按需连上，取正文、写回已读，不排在同步后面。界面只发 [`Cmd`]、收 [`Event`]，
+//! 一条按需连上，取正文、写回标记、移动删除，不排在同步后面。界面只发 [`Cmd`]、收 [`Event`]，
 //! 邮件头由界面自己开数据库连接读。允许加载的远程图片也在这里代取。
 
 use crate::http;
@@ -18,8 +18,10 @@ use tokio::task::{JoinHandle, LocalSet, spawn_local};
 pub enum Cmd {
     /// 取一封正文并解析，缓存里有就不联网
     Body { account: i64, folder: Folder, uid: u32 },
-    /// 本地的已读改动写回服务器
+    /// 本地的标记改动写回服务器
     Flush { account: i64, folder: Folder },
+    /// 移到 `to`，None 为彻底删除。界面已先从本地删掉；失败时重新同步原文件夹，邮件回来
+    Move { account: i64, folder: Folder, uids: Vec<u32>, to: Option<Folder> },
     /// 试登录，通过才存密码、存账号、开始同步；密码先经 [`imap::tidy_secret`]
     Add(Account, String),
     /// 账号设置（代理）改了，按新设置重连
@@ -37,6 +39,8 @@ pub enum Event {
     Error { account: i64, msg: String },
     /// 添加账号的结果：账号 id 或失败原因
     Added(std::result::Result<i64, String>),
+    /// 移动 / 删除失败的原因
+    Failed(String),
 }
 
 pub enum BodyError {
@@ -51,6 +55,7 @@ pub enum BodyError {
 enum Job {
     Body(Folder, u32),
     Flush(Folder),
+    Move(Folder, Vec<u32>, Option<Folder>),
 }
 
 struct Running {
@@ -91,6 +96,7 @@ async fn run(path: String, mut cmds: UnboundedReceiver<Cmd>, again: UnboundedSen
         let (account, job) = match cmd {
             Cmd::Body { account, folder, uid } => (account, Job::Body(folder, uid)),
             Cmd::Flush { account, folder } => (account, Job::Flush(folder)),
+            Cmd::Move { account, folder, uids, to } => (account, Job::Move(folder, uids, to)),
             Cmd::Add(acc, secret) => {
                 let (db, tx, again) = (db.clone(), tx.clone(), again.clone());
                 spawn_local(async move {
@@ -120,9 +126,10 @@ async fn run(path: String, mut cmds: UnboundedReceiver<Cmd>, again: UnboundedSen
         };
         match (running.get(&account), job) {
             (Some(r), job) => drop(r.jobs.unbounded_send(job)),
-            // 正文请求总要有回音，界面才不会一直显示加载中；没写回的已读改动留在库里
+            // 正文请求总要有回音，界面才不会一直显示加载中；没写回的标记改动留在库里；
+            // 移动只在账号连着时才发
             (None, Job::Body(f, uid)) => drop(tx.unbounded_send(Event::Body { folder: f.id, uid, msg: Err(BodyError::Offline) })),
-            (None, Job::Flush(_)) => {}
+            (None, _) => {}
         }
     }
 }
@@ -184,6 +191,19 @@ async fn worker(db: &Store, acc: &Account, secret: &str, mut rx: UnboundedReceiv
                 Job::Body(..) => {}
                 // 失败不用管：改动还记在库里，同步这个文件夹时会写回
                 Job::Flush(f) => drop(with_session(&mut slot, acc, secret, async |s| imap::flush(s, db, &f).await).await),
+                Job::Move(f, uids, to) => {
+                    let r = with_session(&mut slot, acc, secret, async |s| imap::move_to(s, &f, &uids, to.as_ref()).await).await;
+                    if let Err(e) = &r {
+                        let _ = tx.unbounded_send(Event::Failed(e.to_string()));
+                    }
+                    // 成功时同步目标文件夹，移过去的马上看得到；失败时同步原文件夹，本地先删掉的邮件回来
+                    let Some(f) = (if r.is_ok() { to } else { Some(f) }) else { continue };
+                    if let Ok(ch) = with_session(&mut slot, acc, secret, async |s| imap::sync_folder(s, db, &f).await).await
+                        && !ch.is_empty()
+                    {
+                        let _ = tx.unbounded_send(Event::Changed { account: acc.id, folder: f.id });
+                    }
+                }
             }
         }
     }

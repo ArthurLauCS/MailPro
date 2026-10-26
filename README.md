@@ -37,10 +37,11 @@ Mail and settings are stored in `%LOCALAPPDATA%\MailPro`; passwords are stored i
 2. Opening a message marks it read on the server. The reader header lists the blocked remote content; **Load images** loads it for this message, **Always load images from this sender** for every message from that address.
 3. **Browser** (bottom of the left column) chooses where links open. For AdsPower, enter the profile ID and the API key from AdsPower's API settings; the key is kept in Credential Manager.
 4. Drag an account row onto another account to reorder them. An account row glows softly while its inbox has mail received in the last 30 minutes.
+5. Click a message to open it; Ctrl-click adds or removes one, Shift-click selects a range. Archive, delete, move, mark read / unread and star from the buttons at the top of the reader or from the right-click menu; the button at the top of the list marks the whole folder read. Delete moves to Trash, and inside Trash deletes forever after a confirmation. Changes are written to the server; moving and deleting need the account to be connected.
 
 ## Current limits
 
-Version 0.1.0 reads mail. Not yet available: deleting, archiving, moving and starring messages, writing and sending, local search, Outlook / Hotmail accounts (their IMAP requires OAuth), desktop notifications, and import / export of settings.
+Not yet available: writing and sending, local search, Outlook / Hotmail accounts (their IMAP requires OAuth), desktop notifications, and import / export of settings.
 
 ## Development
 

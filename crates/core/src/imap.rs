@@ -1,4 +1,4 @@
-//! IMAP 同步：把文件夹和邮件头拉进本地缓存，写回本地的已读改动，在收件箱上 IDLE 等新变化。
+//! IMAP 同步：把文件夹和邮件头拉进本地缓存，写回本地的标记改动，在收件箱上 IDLE 等新变化；移动、删除邮件。
 
 use crate::store::{self, Account, Folder, Header, Store};
 use async_imap::imap_proto::{BodyStructure, NameAttribute};
@@ -92,7 +92,7 @@ pub async fn sync_all<T: Io>(s: &mut Session<T>, db: &Store, acc: &Account, on: 
 }
 
 /// 同步一个文件夹，结束时它处于选中状态：
-/// 1. 写回本地待写回的已读改动；
+/// 1. 写回本地待写回的标记改动；
 /// 2. 拉 UID 比本地大的新邮件；
 /// 3. 首次同步未完成或封数对不上时和服务器对账：删掉服务器已删的，从新到旧分批补拉缺的；
 /// 4. 更新已有邮件的标记，服务器支持 CONDSTORE 时只拉上次以后改过的。
@@ -140,21 +140,46 @@ pub async fn sync_folder<T: Io>(s: &mut Session<T>, db: &Store, f: &Folder) -> R
     Ok(ch)
 }
 
-/// 只写回本地的已读改动，不做其他同步；界面上标了已读后马上调
+/// 只写回本地的标记改动，不做其他同步；界面上改了标记后马上调
 pub async fn flush<T: Io>(s: &mut Session<T>, db: &Store, f: &Folder) -> Result<()> {
     s.select(&f.name).await?;
     write_pending(s, db, f).await
 }
 
-/// 把待写回的已读改动写回服务器，调用前文件夹要已选中
+/// 把待写回的标记改动写回服务器，调用前文件夹要已选中
 async fn write_pending<T: Io>(s: &mut Session<T>, db: &Store, f: &Folder) -> Result<()> {
     let pending = db.pending(f.id)?;
-    for seen in [true, false] {
-        let uids: Vec<u32> = pending.iter().filter(|p| p.1 == seen).map(|p| p.0).collect();
-        let op = if seen { "+FLAGS.SILENT (\\Seen)" } else { "-FLAGS.SILENT (\\Seen)" };
-        for chunk in uids.chunks(BATCH) {
-            s.uid_store(uid_set(chunk), op).await?.try_for_each(|_| async { Ok(()) }).await?;
-            db.clear_pending(f.id, chunk, seen)?;
+    for (flag, name) in [(store::SEEN, "\\Seen"), (store::FLAGGED, "\\Flagged")] {
+        for on in [true, false] {
+            let uids: Vec<u32> = pending.iter().filter(|p| p.1 & flag != 0 && (p.2 & flag != 0) == on).map(|p| p.0).collect();
+            let op = format!("{}FLAGS.SILENT ({name})", if on { '+' } else { '-' });
+            for chunk in uids.chunks(BATCH) {
+                s.uid_store(uid_set(chunk), &op).await?.try_for_each(|_| async { Ok(()) }).await?;
+                db.clear_pending(f.id, chunk, flag, on)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// 把 `f` 里的这些邮件移到 `to`，`to` 为 None 是彻底删除。服务器不支持 MOVE 时退回
+/// 复制 + 标删除 + UID EXPUNGE，只清掉这几封，不连带别的客户端标了删除的邮件（要 UIDPLUS）
+pub async fn move_to<T: Io>(s: &mut Session<T>, f: &Folder, uids: &[u32], to: Option<&Folder>) -> Result<()> {
+    let caps = s.capabilities().await?;
+    let (mv, uidplus) = (caps.has_str("MOVE"), caps.has_str("UIDPLUS"));
+    s.select(&f.name).await?;
+    for chunk in uids.chunks(BATCH) {
+        let set = uid_set(chunk);
+        match to {
+            Some(to) if mv => s.uid_mv(&set, &to.name).await?,
+            _ if !uidplus => return Err("服务器不支持 MOVE 和 UIDPLUS，没法只移走这几封".into()),
+            to => {
+                if let Some(to) = to {
+                    s.uid_copy(&set, &to.name).await?;
+                }
+                s.uid_store(&set, "+FLAGS.SILENT (\\Deleted)").await?.try_for_each(|_| async { Ok(()) }).await?;
+                s.uid_expunge(&set).await?.try_for_each(|_| async { Ok(()) }).await?;
+            }
         }
     }
     Ok(())

@@ -10,13 +10,15 @@ use futures::channel::mpsc::UnboundedSender;
 use futures::channel::oneshot;
 use gpui::prelude::*;
 use gpui::{
-    AnyElement, App, Bounds, BoxShadow, ClipboardItem, Context, Entity, FontWeight, PathPromptOptions, Pixels, ScrollStrategy, SharedString, Task,
-    UniformListScrollHandle, WeakEntity, Window, canvas, div, hsla, point, px, relative, uniform_list, white,
+    AnyElement, App, Bounds, BoxShadow, ClickEvent, ClipboardItem, Context, DismissEvent, Entity, FontWeight, Modifiers, MouseButton, PathPromptOptions,
+    Pixels, ScrollStrategy, SharedString, Subscription, Task, UniformListScrollHandle, WeakEntity, Window, canvas, div, hsla, point, px, relative,
+    uniform_list, white,
 };
 use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::dialog::Dialog;
 use gpui_component::input::{Input, InputState};
-use gpui_component::menu::{DropdownMenu, PopupMenuItem};
+use gpui_component::menu::{ContextMenuExt, DropdownMenu, PopupMenuItem};
+use gpui_component::notification::Notification;
 use gpui_component::resizable::{h_resizable, resizable_panel};
 use gpui_component::scroll::ScrollableElement;
 use gpui_component::{ActiveTheme, Disableable, Icon, Sizable, WindowExt, h_flex, v_flex};
@@ -63,6 +65,16 @@ impl Render for DraggedAccount {
         let theme = cx.theme();
         div().px_3().py_1().rounded(R_MD).bg(theme.primary).text_color(theme.primary_foreground).text_sm().font_weight(FontWeight::SEMIBOLD).child(self.email.clone())
     }
+}
+
+/// 对选中邮件的操作，阅读区操作栏和右键菜单共用；bool 为设上还是去掉
+#[derive(Clone, Copy)]
+enum Act {
+    Archive,
+    Delete,
+    Move,
+    Seen(bool),
+    Star(bool),
 }
 
 enum Body {
@@ -146,6 +158,12 @@ pub struct MailPro {
     sel: Option<(i64, i64)>,
     /// 选中文件夹的全部邮件头，新的在前
     headers: Vec<Header>,
+    /// 列表里选中的邮件（uid）；只选一封且打开了时阅读区显示它，否则显示选了几封和操作栏
+    picked: HashSet<u32>,
+    /// Shift 点选的起点：上次直接点或 Ctrl 点的那封
+    anchor: Option<u32>,
+    /// 右键菜单开着时有值。这时正文藏起来：盖在正文上的菜单项点不到，点击会落进 WebView2
+    menu: Option<Subscription>,
     scroll: UniformListScrollHandle,
     load: Task<()>,
     reading: Option<Reading>,
@@ -206,6 +224,9 @@ impl MailPro {
             accounts: Vec::new(),
             sel: None,
             headers: Vec::new(),
+            picked: HashSet::new(),
+            anchor: None,
+            menu: None,
             scroll: UniformListScrollHandle::new(),
             load: Task::ready(()),
             reading,
@@ -313,6 +334,7 @@ impl MailPro {
         if self.sel != Some((account, folder)) {
             self.sel = Some((account, folder));
             self.headers.clear();
+            (self.picked, self.anchor) = (HashSet::new(), None);
             self.scroll.scroll_to_item(0, ScrollStrategy::Top);
         }
         self.load(cx);
@@ -338,24 +360,143 @@ impl MailPro {
         Some(a.folders.iter().find(|f| f.0.id == folder)?.0.clone())
     }
 
-    /// 打开一封：标已读（先改本地，再让引擎写回服务器），再取正文
+    /// 打开一封：标已读，再取正文
     fn open(&mut self, uid: u32, cx: &mut Context<Self>) {
         let Some((account, folder)) = self.sel else { return };
         let Some(f) = self.folder(account, folder) else { return };
-        let Some(h) = self.headers.iter_mut().find(|h| h.uid == uid) else { return };
-        let unread = h.flags & store::SEEN == 0;
-        if unread && self.db.mark_seen(folder, uid, true).is_ok() {
-            h.flags |= store::SEEN;
-            let _ = self.cmd.unbounded_send(Cmd::Flush { account, folder: f.clone() });
-        }
+        self.mark(store::SEEN, true, |h| h.uid == uid, cx);
+        let Some(h) = self.headers.iter().find(|h| h.uid == uid) else { return };
         let from = if h.from_name.is_empty() { h.from_addr.clone() } else { h.from_name.clone() };
         let trusted = self.db.images_allowed(&h.from_addr).unwrap_or(false);
         self.reading = Some(Reading::new(account, folder, uid, h.date, h.subject.clone(), from, h.from_addr.clone(), trusted));
-        if unread {
-            self.reload_folders(account);
-        }
         let _ = self.cmd.unbounded_send(Cmd::Body { account, folder: f, uid });
         cx.notify();
+    }
+
+    /// 点一行：直接点选中并打开这封；Ctrl 点增减一封、Shift 点从上次点的那封选到这封，都不打开
+    fn click(&mut self, uid: u32, m: Modifiers, cx: &mut Context<Self>) {
+        let index = |uid| self.headers.iter().position(|h| h.uid == uid);
+        if m.shift
+            && let Some((a, b)) = self.anchor.and_then(index).zip(index(uid))
+        {
+            self.picked = self.headers[a.min(b)..=a.max(b)].iter().map(|h| h.uid).collect();
+        } else if m.secondary() || m.shift {
+            if !self.picked.remove(&uid) {
+                self.picked.insert(uid);
+            }
+            self.anchor = Some(uid);
+        } else {
+            (self.picked, self.anchor) = (HashSet::from([uid]), Some(uid));
+            return self.open(uid, cx);
+        }
+        self.reading = None;
+        cx.notify();
+    }
+
+    /// 给 `pick` 选出的邮件设上 / 去掉标记：先改本地，再让引擎写回服务器
+    fn mark(&mut self, flag: u8, on: bool, pick: impl Fn(&Header) -> bool, cx: &mut Context<Self>) {
+        let Some((account, folder)) = self.sel else { return };
+        let Some(f) = self.folder(account, folder) else { return };
+        let hit = |h: &Header| (h.flags & flag != 0) != on && pick(h);
+        let uids: Vec<u32> = self.headers.iter().filter(|h| hit(h)).map(|h| h.uid).collect();
+        if uids.is_empty() || self.db.mark(folder, &uids, flag, on).is_err() {
+            return;
+        }
+        // 选出的这些标记位都和目标相反，翻过来即是
+        self.headers.iter_mut().filter(|h| hit(h)).for_each(|h| h.flags ^= flag);
+        let _ = self.cmd.unbounded_send(Cmd::Flush { account, folder: f });
+        self.reload_folders(account);
+        cx.notify();
+    }
+
+    /// 账号里 `role` 用途的文件夹
+    fn role_folder(&self, account: i64, role: &str) -> Option<Folder> {
+        let a = self.accounts.iter().find(|a| a.acc.id == account)?;
+        Some(a.folders.iter().find(|f| f.0.role.as_deref() == Some(role))?.0.clone())
+    }
+
+    /// 归档的去处：归档文件夹，没有就是所有邮件（Gmail 的归档即去掉当前标签）；正在看的就是它时没有
+    fn archive_to(&self) -> Option<Folder> {
+        let (account, folder) = self.sel?;
+        self.role_folder(account, "archive").or_else(|| self.role_folder(account, "all")).filter(|f| f.id != folder)
+    }
+
+    /// 选中邮件能做的操作及其图标、文字
+    fn acts(&self, t: &'static T) -> Vec<(Act, IconName, &'static str)> {
+        // 选中的多在列表前部，找齐就停
+        let flags: Vec<u8> = self.headers.iter().filter(|h| self.picked.contains(&h.uid)).take(self.picked.len()).map(|h| h.flags).collect();
+        let unread = flags.iter().any(|f| f & store::SEEN == 0);
+        let unstarred = flags.iter().any(|f| f & store::FLAGGED == 0);
+        let archive = self.archive_to().map(|_| (Act::Archive, IconName::Archive, t.archive));
+        archive
+            .into_iter()
+            .chain([
+                (Act::Delete, IconName::Trash, t.delete),
+                (Act::Move, IconName::FolderInput, t.move_to),
+                if unread { (Act::Seen(true), IconName::MailOpen, t.mark_read) } else { (Act::Seen(false), IconName::Mail, t.mark_unread) },
+                if unstarred { (Act::Star(true), IconName::Star, t.star) } else { (Act::Star(false), IconName::StarOff, t.unstar) },
+            ])
+            .collect()
+    }
+
+    fn act(&mut self, act: Act, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((account, folder)) = self.sel else { return };
+        let view = cx.entity().downgrade();
+        match act {
+            Act::Archive => {
+                if let Some(to) = self.archive_to() {
+                    self.move_picked(Some(to), window, cx);
+                }
+            }
+            // 移到已删除；已经在已删除里，或账号没有已删除文件夹，就彻底删除，先确认
+            Act::Delete => match self.role_folder(account, "trash").filter(|f| f.id != folder) {
+                Some(trash) => self.move_picked(Some(trash), window, cx),
+                None => {
+                    let n = self.picked.len();
+                    window.open_dialog(cx, move |dialog, _, cx| delete_dialog(n, &view, dialog, cx));
+                }
+            },
+            Act::Move => {
+                let Some(a) = self.accounts.iter().find(|a| a.acc.id == account) else { return };
+                let folders: Vec<Folder> = a.folders.iter().map(|f| f.0.clone()).filter(|f| f.id != folder).collect();
+                window.open_dialog(cx, move |dialog, _, cx| move_dialog(&folders, &view, dialog, cx));
+            }
+            Act::Seen(on) | Act::Star(on) => {
+                let flag = if matches!(act, Act::Seen(_)) { store::SEEN } else { store::FLAGGED };
+                let picked = std::mem::take(&mut self.picked);
+                self.mark(flag, on, |h| picked.contains(&h.uid), cx);
+                self.picked = picked;
+            }
+        }
+    }
+
+    /// 把选中的邮件移到 `to`，None 为彻底删除：先从本地删掉，再让引擎在服务器上移。账号没连上时不动
+    fn move_picked(&mut self, to: Option<Folder>, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((account, folder)) = self.sel else { return };
+        let Some(f) = self.folder(account, folder) else { return };
+        if self.accounts.iter().any(|a| a.acc.id == account && a.error.is_some()) {
+            return window.push_notification(Notification::error(t(cx).offline), cx);
+        }
+        let uids: Vec<u32> = self.headers.iter().filter(|h| self.picked.contains(&h.uid)).map(|h| h.uid).collect();
+        if uids.is_empty() || self.db.remove(folder, &uids).is_err() {
+            return;
+        }
+        self.headers.retain(|h| !self.picked.contains(&h.uid));
+        if self.reading.as_ref().is_some_and(|r| r.folder == folder && self.picked.contains(&r.uid)) {
+            self.reading = None;
+        }
+        (self.picked, self.anchor) = (HashSet::new(), None);
+        let _ = self.cmd.unbounded_send(Cmd::Move { account, folder: f, uids, to });
+        self.reload_folders(account);
+        cx.notify();
+    }
+
+    /// 阅读区的操作栏
+    fn actions(&self, cx: &mut Context<Self>) -> AnyElement {
+        let buttons = self.acts(t(cx)).into_iter().map(|(act, icon, tip)| {
+            Button::new(tip).ghost().small().icon(icon).tooltip(tip).on_click(cx.listener(move |v, _, window, cx| v.act(act, window, cx)))
+        });
+        h_flex().flex_none().gap_1().children(buttons).into_any_element()
     }
 
     fn on_engine(&mut self, e: Event, window: &mut Window, cx: &mut Context<Self>) {
@@ -399,6 +540,7 @@ impl MailPro {
                 }
                 self.select_first(Some(account), cx);
             }
+            Event::Failed(e) => window.push_notification(Notification::error(format!("{}{e}", t.action_failed)), cx),
             Event::Added(Err(e)) => {
                 if let Some(f) = &self.form {
                     f.update(cx, |f, cx| {
@@ -714,8 +856,9 @@ impl MailPro {
         let h = &self.headers[i];
         let uid = h.uid;
         let unread = h.flags & store::SEEN == 0;
-        let open = self.reading.as_ref().is_some_and(|r| r.uid == uid && self.sel.is_some_and(|s| s.1 == r.folder));
+        let picked = self.picked.contains(&uid);
         let from = if h.from_name.is_empty() { &h.from_addr } else { &h.from_name };
+        let view = cx.entity().downgrade();
         let subject = if h.subject.is_empty() { t.no_subject.to_string() } else { h.subject.clone() };
         v_flex()
             .id(("message", uid as usize))
@@ -728,8 +871,8 @@ impl MailPro {
             .border_b_1()
             .border_color(theme.border)
             .cursor_pointer()
-            .when(open, |d| d.bg(theme.list_active).child(div().absolute().left_0().top_0().bottom_0().w(px(3.)).bg(theme.primary)))
-            .when(!open, |d| d.hover(|d| d.bg(theme.list_hover)))
+            .when(picked, |d| d.bg(theme.list_active).child(div().absolute().left_0().top_0().bottom_0().w(px(3.)).bg(theme.primary)))
+            .when(!picked, |d| d.hover(|d| d.bg(theme.list_hover)))
             .child(
                 h_flex()
                     .gap_2()
@@ -747,10 +890,39 @@ impl MailPro {
                     .when(h.attach, |d| d.child(Icon::new(IconName::Paperclip).xsmall()))
                     .when(h.flags & store::FLAGGED != 0, |d| d.child(Icon::new(IconName::StarFill).xsmall().text_color(theme.warning))),
             )
-            .on_click(cx.listener(move |v, _, _, cx| v.open(uid, cx)))
+            .on_click(cx.listener(move |v, e: &ClickEvent, _, cx| v.click(uid, e.modifiers(), cx)))
+            // 右键没选中的行先选中它；菜单下一帧才建，那时已选好
+            .on_mouse_down(MouseButton::Right, cx.listener(move |v, _, _, cx| if !v.picked.contains(&uid) { v.click(uid, Modifiers::none(), cx) }))
+            .context_menu(move |menu, _, cx| {
+                let Some(view) = view.upgrade() else { return menu };
+                // 菜单开着时正文藏起来（见 `menu` 字段），关掉时恢复
+                let me = cx.weak_entity();
+                let v = view.clone();
+                cx.defer(move |cx| {
+                    let Some(me) = me.upgrade() else { return };
+                    v.update(cx, |v, cx| {
+                        v.menu = Some(cx.subscribe(&me, |v, _, _: &DismissEvent, cx| {
+                            v.menu = None;
+                            cx.notify();
+                        }));
+                        cx.notify();
+                    });
+                });
+                view.read(cx).acts(t).into_iter().fold(menu, |menu, (act, icon, label)| {
+                    let view = view.downgrade();
+                    menu.item(PopupMenuItem::new(label).icon(icon).on_click(move |_, window, cx| {
+                        let _ = view.update(cx, |v, cx| v.act(act, window, cx));
+                    }))
+                })
+            })
     }
 
     fn list(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let unread = self.sel.and_then(|(a, f)| self.accounts.iter().find(|x| x.acc.id == a)?.folders.iter().find(|x| x.0.id == f).map(|x| x.1));
+        let all_read = unread.is_some_and(|n| n > 0).then(|| {
+            let tip = t(cx).mark_all_read;
+            Button::new("all-read").ghost().xsmall().icon(IconName::CheckCheck).tooltip(tip).on_click(cx.listener(|v, _, _, cx| v.mark(store::SEEN, true, |_| true, cx)))
+        });
         let (t, theme) = (t(cx), cx.theme());
         let empty = self.headers.is_empty() && self.sel.is_some();
         let rows = uniform_list(
@@ -774,7 +946,8 @@ impl MailPro {
                     .border_color(theme.border)
                     .child(div().flex_none().font_family(DISPLAY).font_weight(FontWeight::BOLD).child(folder_label(t, &self.folder(a, f)?)))
                     .child(muted(email).flex_1().truncate())
-                    .child(muted(format!("{}{}", self.headers.len(), t.messages)).flex_none()),
+                    .child(muted(format!("{}{}", self.headers.len(), t.messages)).flex_none())
+                    .children(all_read),
             )
         });
         v_flex().size_full().bg(theme.background).children(head).child(
@@ -789,6 +962,9 @@ impl MailPro {
 
     fn reader(&self, show: bool, cx: &mut Context<Self>) -> impl IntoElement {
         let remote = self.reading.as_ref().filter(|r| matches!(r.body, Body::Shown)).map(|r| self.remote(r, cx));
+        // 操作栏：打开了的那封在头部，多选时在中间
+        let actions = (!self.picked.is_empty()).then(|| self.actions(cx));
+        let (head_actions, picked_actions) = if self.reading.is_some() { (actions, None) } else { (None, actions) };
         let (t, theme) = (t(cx), cx.theme());
         let (c, placed) = (self.web.clone(), self.placed.clone());
         // 每帧量出正文区的位置交给 WebView2；没有正文或开着对话框时藏起来，否则点击会落到正文上
@@ -803,6 +979,7 @@ impl MailPro {
             }
         };
         let status = match &self.reading {
+            None if !self.picked.is_empty() => format!("{}{}{}", t.picked, self.picked.len(), t.messages),
             None => t.no_selection.to_string(),
             Some(Reading { body: Body::Loading, .. }) => t.loading.to_string(),
             Some(Reading { body: Body::Failed(e), .. }) => e.clone(),
@@ -818,7 +995,13 @@ impl MailPro {
                 .bg(theme.background)
                 .border_b_1()
                 .border_color(theme.border)
-                .child(div().font_family(DISPLAY).text_xl().font_weight(FontWeight::BOLD).line_height(relative(1.3)).child(subject))
+                .child(
+                    h_flex()
+                        .items_start()
+                        .gap_2()
+                        .child(div().flex_1().min_w_0().font_family(DISPLAY).text_xl().font_weight(FontWeight::BOLD).line_height(relative(1.3)).child(subject))
+                        .children(head_actions),
+                )
                 .child(
                     h_flex()
                         .gap_2()
@@ -832,7 +1015,9 @@ impl MailPro {
             div()
                 .flex_1()
                 .relative()
-                .when(!show, |d| d.bg(theme.background).flex().items_center().justify_center().font_family(PROSE).text_color(theme.muted_foreground).child(status))
+                .when(!show, |d| {
+                    d.bg(theme.background).flex().flex_col().gap_3().items_center().justify_center().font_family(PROSE).text_color(theme.muted_foreground).child(status).children(picked_actions)
+                })
                 .child(canvas(place, |_, _, _, _| {}).absolute().size_full()),
         )
     }
@@ -1013,7 +1198,7 @@ fn link_dialog(dlg: &Entity<LinkDlg>, view: &WeakEntity<MailPro>, dialog: Dialog
 
 impl Render for MailPro {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let show = matches!(self.reading, Some(Reading { body: Body::Shown, .. })) && !window.has_active_dialog(cx);
+        let show = matches!(self.reading, Some(Reading { body: Body::Shown, .. })) && !window.has_active_dialog(cx) && self.menu.is_none();
         h_resizable("columns")
             .child(resizable_panel().size(px(240.)).size_range(px(160.)..px(480.)).child(self.sidebar(cx)))
             .child(resizable_panel().size(px(380.)).size_range(px(260.)..px(800.)).child(self.list(cx)))
@@ -1061,6 +1246,56 @@ fn form_dialog(form: &Entity<Form>, view: &WeakEntity<MailPro>, dialog: Dialog, 
 }
 
 /// 对话框标题：衬线粗体
+/// 彻底删除选中的 `n` 封前确认
+fn delete_dialog(n: usize, view: &WeakEntity<MailPro>, dialog: Dialog, cx: &mut App) -> Dialog {
+    let (t, theme) = (t(cx), cx.theme());
+    let view = view.clone();
+    dialog
+        .title(title(t.delete_forever))
+        .w(px(400.))
+        .child(
+            v_flex()
+                .gap_1()
+                .font_family(PROSE)
+                .text_sm()
+                .child(format!("{}{n}{}", t.picked, t.messages))
+                .child(div().text_color(theme.muted_foreground).child(t.delete_forever_hint)),
+        )
+        .footer(
+            h_flex()
+                .justify_end()
+                .gap_2()
+                .child(Button::new("cancel").label(t.cancel).on_click(|_, window, cx| window.close_dialog(cx)))
+                .child(Button::new("ok").danger().label(t.delete_forever).on_click(move |_, window, cx| {
+                    window.close_dialog(cx);
+                    let _ = view.update(cx, |v, cx| v.move_picked(None, window, cx));
+                })),
+        )
+}
+
+/// 选移动的去处：账号里当前文件夹以外的文件夹
+fn move_dialog(folders: &[Folder], view: &WeakEntity<MailPro>, dialog: Dialog, cx: &mut App) -> Dialog {
+    let (t, theme) = (t(cx), cx.theme());
+    let rows = folders.iter().enumerate().map(|(i, f)| {
+        let (f, view) = (f.clone(), view.clone());
+        h_flex()
+            .id(("to", i))
+            .gap_2()
+            .px_2()
+            .py_1p5()
+            .rounded(R_MD)
+            .cursor_pointer()
+            .hover(|d| d.bg(theme.list_hover))
+            .child(Icon::new(folder_icon(&f)).small().text_color(theme.muted_foreground))
+            .child(div().flex_1().truncate().text_sm().child(folder_label(t, &f)))
+            .on_click(move |_, window, cx| {
+                window.close_dialog(cx);
+                let _ = view.update(cx, |v, cx| v.move_picked(Some(f.clone()), window, cx));
+            })
+    });
+    dialog.title(title(t.move_to.trim_end_matches('…'))).w(px(360.)).child(v_flex().id("folders").max_h(px(420.)).overflow_y_scroll().children(rows))
+}
+
 fn title(s: &str) -> impl IntoElement {
     div().font_family(DISPLAY).text_xl().font_weight(FontWeight::BOLD).child(s.to_string())
 }
