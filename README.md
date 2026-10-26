@@ -38,10 +38,11 @@ Mail and settings are stored in `%LOCALAPPDATA%\MailPro`; passwords are stored i
 3. **Browser** (bottom of the left column) chooses where links open. For AdsPower, enter the profile ID and the API key from AdsPower's API settings; the key is kept in Credential Manager.
 4. Drag an account row onto another account to reorder them. An account row glows softly while its inbox has mail received in the last 30 minutes.
 5. Click a message to open it; Ctrl-click adds or removes one, Shift-click selects a range. Archive, delete, move, mark read / unread and star from the buttons at the top of the reader or from the right-click menu; the button at the top of the list marks the whole folder read. Delete moves to Trash, and inside Trash deletes forever after a confirmation. Changes are written to the server; moving and deleting need the account to be connected.
+6. The search box at the top of the list finds messages whose subject or sender contains every word you type. The button next to it switches between **This folder** and **All mailboxes** (every folder of every account; results show their folder). Message bodies are not searched. Clicking a folder clears the search.
 
 ## Current limits
 
-Not yet available: writing and sending, local search, Outlook / Hotmail accounts (their IMAP requires OAuth), desktop notifications, and import / export of settings.
+Not yet available: writing and sending, Outlook / Hotmail accounts (their IMAP requires OAuth), desktop notifications, and import / export of settings.
 
 ## Development
 

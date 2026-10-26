@@ -252,13 +252,14 @@ pub async fn watch_session<T: Io>(
 /// 拉一批邮件头存进本地，返回新增封数
 async fn fetch_headers<T: Io>(s: &mut Session<T>, db: &Store, folder: i64, set: &str) -> Result<usize> {
     let fetched: Vec<Fetch> = s.uid_fetch(set, HEAD).await?.try_collect().await?;
-    Ok(db.put_headers(folder, &fetched.iter().filter_map(header).collect::<Vec<_>>())?)
+    Ok(db.put_headers(folder, &fetched.iter().filter_map(|m| header(folder, m)).collect::<Vec<_>>())?)
 }
 
-fn header(m: &Fetch) -> Option<Header> {
+fn header(folder: i64, m: &Fetch) -> Option<Header> {
     let head = m.header().and_then(|h| MessageParser::new().parse_headers(h));
     let from = head.as_ref().and_then(|h| h.from()).and_then(|l| l.first());
     Some(Header {
+        folder,
         uid: m.uid?,
         flags: flag_bits(m),
         date: m.internal_date().map_or(0, |d| d.timestamp()),

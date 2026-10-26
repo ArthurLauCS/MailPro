@@ -16,7 +16,7 @@ use gpui::{
 };
 use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::dialog::Dialog;
-use gpui_component::input::{Input, InputState};
+use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::menu::{ContextMenuExt, DropdownMenu, PopupMenuItem};
 use gpui_component::notification::Notification;
 use gpui_component::resizable::{h_resizable, resizable_panel};
@@ -158,10 +158,20 @@ pub struct MailPro {
     sel: Option<(i64, i64)>,
     /// 选中文件夹的全部邮件头，新的在前
     headers: Vec<Header>,
-    /// 列表里选中的邮件（uid）；只选一封且打开了时阅读区显示它，否则显示选了几封和操作栏
+    /// 列表里是按全部文件夹搜出的结果，每行标出所在文件夹
+    mixed: bool,
+    /// 列表里选中的邮件（uid），都在 `picked_in` 这个（账号，文件夹）里：按全部文件夹搜时结果来自多个文件夹，
+    /// 只能在同一个里多选。只选一封且打开了时阅读区显示它，否则显示选了几封和操作栏
     picked: HashSet<u32>,
+    picked_in: (i64, i64),
     /// Shift 点选的起点：上次直接点或 Ctrl 点的那封
     anchor: Option<u32>,
+    /// 搜索框；有字时列表显示搜索结果
+    query: Entity<InputState>,
+    /// 搜索范围：全部账号的全部文件夹，否则只搜选中的文件夹
+    search_all: bool,
+    /// 打字停顿后再搜的计时
+    search: Task<()>,
     /// 右键菜单开着时有值。这时正文藏起来：盖在正文上的菜单项点不到，点击会落进 WebView2
     menu: Option<Subscription>,
     scroll: UniformListScrollHandle,
@@ -215,6 +225,13 @@ impl MailPro {
             *current.borrow_mut() = Some(m);
             r
         });
+        let query = cx.new(|cx| InputState::new(window, cx).placeholder(t(cx).search).clean_on_escape());
+        cx.subscribe_in(&query, window, |v, _, e: &InputEvent, _, cx| {
+            if matches!(e, InputEvent::Change) {
+                v.search_later(cx);
+            }
+        })
+        .detach();
         let browser = db.setting("browser").ok().flatten().unwrap_or_default();
         let collapsed = db.setting("collapsed").ok().flatten().unwrap_or_default().split_whitespace().filter_map(|s| s.parse().ok()).collect();
         let mut v = MailPro {
@@ -224,8 +241,13 @@ impl MailPro {
             accounts: Vec::new(),
             sel: None,
             headers: Vec::new(),
+            mixed: false,
             picked: HashSet::new(),
+            picked_in: (0, 0),
             anchor: None,
+            query,
+            search_all: false,
+            search: Task::ready(()),
             menu: None,
             scroll: UniformListScrollHandle::new(),
             load: Task::ready(()),
@@ -340,19 +362,57 @@ impl MailPro {
         self.load(cx);
     }
 
-    /// 在后台线程另开连接读选中文件夹的邮件头，大文件夹不卡界面
+    /// 在后台线程另开连接读邮件头，大文件夹不卡界面：搜索框有字时读搜到的，否则读选中的文件夹
     fn load(&mut self, cx: &mut Context<Self>) {
         let Some((_, folder)) = self.sel else { return };
+        let query = self.query.read(cx).value().to_string();
+        let mixed = self.search_all && !query.trim().is_empty();
+        let folders = if mixed { self.search_folders() } else { vec![folder] };
         let path = self.path.clone();
         self.load = cx.spawn(async move |this, cx| {
-            let headers = cx.background_spawn(async move { Store::open(&path).and_then(|db| db.list(folder, u32::MAX)) }).await;
+            let headers = cx
+                .background_spawn(async move {
+                    let db = Store::open(&path)?;
+                    let words: Vec<&str> = query.split_whitespace().collect();
+                    if words.is_empty() { db.list(folder, u32::MAX) } else { db.search(&folders, &words) }
+                })
+                .await;
             let _ = this.update(cx, |v, cx| {
                 if v.sel.is_some_and(|s| s.1 == folder) {
-                    v.headers = headers.unwrap_or_default();
+                    (v.headers, v.mixed) = (headers.unwrap_or_default(), mixed);
+                    // 选中的邮件不在新列表里了（搜索词改了、被移走）就不再算选中
+                    if !v.picked.is_empty() {
+                        let shown: HashSet<u32> = v.headers.iter().filter(|h| h.folder == v.picked_in.1).map(|h| h.uid).collect();
+                        v.picked.retain(|u| shown.contains(u));
+                    }
                     cx.notify();
                 }
             });
         });
+    }
+
+    /// 搜索框改了：清空时马上回到文件夹列表，否则停顿一会儿再搜，不每打一个字都搜
+    fn search_later(&mut self, cx: &mut Context<Self>) {
+        self.scroll.scroll_to_item(0, ScrollStrategy::Top);
+        if self.query.read(cx).value().trim().is_empty() {
+            self.search = Task::ready(());
+            return self.load(cx);
+        }
+        self.search = cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(Duration::from_millis(300)).await;
+            let _ = this.update(cx, |v, cx| v.load(cx));
+        });
+    }
+
+    /// 按全部文件夹搜时搜哪些：有“所有邮件”的账号（Gmail）只搜它和垃圾邮件、已删除，每封只出现一次；其他账号搜全部
+    fn search_folders(&self) -> Vec<i64> {
+        self.accounts
+            .iter()
+            .flat_map(|a| {
+                let gmail = a.folders.iter().any(|f| f.0.role.as_deref() == Some("all"));
+                a.folders.iter().filter(move |f| !gmail || matches!(f.0.role.as_deref(), Some("all" | "junk" | "trash"))).map(|f| f.0.id)
+            })
+            .collect()
     }
 
     fn folder(&self, account: i64, folder: i64) -> Option<Folder> {
@@ -360,12 +420,21 @@ impl MailPro {
         Some(a.folders.iter().find(|f| f.0.id == folder)?.0.clone())
     }
 
+    /// 文件夹所属的账号和文件夹本身
+    fn locate(&self, folder: i64) -> Option<(&Acct, &Folder)> {
+        self.accounts.iter().find_map(|a| Some((a, &a.folders.iter().find(|f| f.0.id == folder)?.0)))
+    }
+
+    /// 选中的邮件里有没有这封
+    fn is_picked(&self, h: &Header) -> bool {
+        h.folder == self.picked_in.1 && self.picked.contains(&h.uid)
+    }
+
     /// 打开一封：标已读，再取正文
-    fn open(&mut self, uid: u32, cx: &mut Context<Self>) {
-        let Some((account, folder)) = self.sel else { return };
+    fn open(&mut self, account: i64, folder: i64, uid: u32, cx: &mut Context<Self>) {
         let Some(f) = self.folder(account, folder) else { return };
-        self.mark(store::SEEN, true, |h| h.uid == uid, cx);
-        let Some(h) = self.headers.iter().find(|h| h.uid == uid) else { return };
+        self.mark((account, folder), store::SEEN, true, |h| h.uid == uid, cx);
+        let Some(h) = self.headers.iter().find(|h| h.folder == folder && h.uid == uid) else { return };
         let from = if h.from_name.is_empty() { h.from_addr.clone() } else { h.from_name.clone() };
         let trusted = self.db.images_allowed(&h.from_addr).unwrap_or(false);
         self.reading = Some(Reading::new(account, folder, uid, h.date, h.subject.clone(), from, h.from_addr.clone(), trusted));
@@ -373,13 +442,18 @@ impl MailPro {
         cx.notify();
     }
 
-    /// 点一行：直接点选中并打开这封；Ctrl 点增减一封、Shift 点从上次点的那封选到这封，都不打开
-    fn click(&mut self, uid: u32, m: Modifiers, cx: &mut Context<Self>) {
-        let index = |uid| self.headers.iter().position(|h| h.uid == uid);
+    /// 点一行：直接点选中并打开这封；Ctrl 点增减一封、Shift 点从上次点的那封选到这封，都不打开。
+    /// 只能在同一个文件夹里多选，点了别的文件夹的邮件就从它重新选起
+    fn click(&mut self, folder: i64, uid: u32, m: Modifiers, cx: &mut Context<Self>) {
+        let Some(account) = self.locate(folder).map(|(a, _)| a.acc.id) else { return };
+        if self.picked_in != (account, folder) {
+            (self.picked, self.anchor, self.picked_in) = (HashSet::new(), None, (account, folder));
+        }
+        let index = |uid| self.headers.iter().position(|h| h.folder == folder && h.uid == uid);
         if m.shift
             && let Some((a, b)) = self.anchor.and_then(index).zip(index(uid))
         {
-            self.picked = self.headers[a.min(b)..=a.max(b)].iter().map(|h| h.uid).collect();
+            self.picked = self.headers[a.min(b)..=a.max(b)].iter().filter(|h| h.folder == folder).map(|h| h.uid).collect();
         } else if m.secondary() || m.shift {
             if !self.picked.remove(&uid) {
                 self.picked.insert(uid);
@@ -387,17 +461,16 @@ impl MailPro {
             self.anchor = Some(uid);
         } else {
             (self.picked, self.anchor) = (HashSet::from([uid]), Some(uid));
-            return self.open(uid, cx);
+            return self.open(account, folder, uid, cx);
         }
         self.reading = None;
         cx.notify();
     }
 
-    /// 给 `pick` 选出的邮件设上 / 去掉标记：先改本地，再让引擎写回服务器
-    fn mark(&mut self, flag: u8, on: bool, pick: impl Fn(&Header) -> bool, cx: &mut Context<Self>) {
-        let Some((account, folder)) = self.sel else { return };
+    /// 给文件夹里 `pick` 选出的邮件设上 / 去掉标记：先改本地，再让引擎写回服务器
+    fn mark(&mut self, (account, folder): (i64, i64), flag: u8, on: bool, pick: impl Fn(&Header) -> bool, cx: &mut Context<Self>) {
         let Some(f) = self.folder(account, folder) else { return };
-        let hit = |h: &Header| (h.flags & flag != 0) != on && pick(h);
+        let hit = |h: &Header| h.folder == folder && (h.flags & flag != 0) != on && pick(h);
         let uids: Vec<u32> = self.headers.iter().filter(|h| hit(h)).map(|h| h.uid).collect();
         if uids.is_empty() || self.db.mark(folder, &uids, flag, on).is_err() {
             return;
@@ -417,14 +490,14 @@ impl MailPro {
 
     /// 归档的去处：归档文件夹，没有就是所有邮件（Gmail 的归档即去掉当前标签）；正在看的就是它时没有
     fn archive_to(&self) -> Option<Folder> {
-        let (account, folder) = self.sel?;
+        let (account, folder) = self.picked_in;
         self.role_folder(account, "archive").or_else(|| self.role_folder(account, "all")).filter(|f| f.id != folder)
     }
 
     /// 选中邮件能做的操作及其图标、文字
     fn acts(&self, t: &'static T) -> Vec<(Act, IconName, &'static str)> {
         // 选中的多在列表前部，找齐就停
-        let flags: Vec<u8> = self.headers.iter().filter(|h| self.picked.contains(&h.uid)).take(self.picked.len()).map(|h| h.flags).collect();
+        let flags: Vec<u8> = self.headers.iter().filter(|h| self.is_picked(h)).take(self.picked.len()).map(|h| h.flags).collect();
         let unread = flags.iter().any(|f| f & store::SEEN == 0);
         let unstarred = flags.iter().any(|f| f & store::FLAGGED == 0);
         let archive = self.archive_to().map(|_| (Act::Archive, IconName::Archive, t.archive));
@@ -440,7 +513,7 @@ impl MailPro {
     }
 
     fn act(&mut self, act: Act, window: &mut Window, cx: &mut Context<Self>) {
-        let Some((account, folder)) = self.sel else { return };
+        let (account, folder) = self.picked_in;
         let view = cx.entity().downgrade();
         match act {
             Act::Archive => {
@@ -464,7 +537,7 @@ impl MailPro {
             Act::Seen(on) | Act::Star(on) => {
                 let flag = if matches!(act, Act::Seen(_)) { store::SEEN } else { store::FLAGGED };
                 let picked = std::mem::take(&mut self.picked);
-                self.mark(flag, on, |h| picked.contains(&h.uid), cx);
+                self.mark(self.picked_in, flag, on, |h| picked.contains(&h.uid), cx);
                 self.picked = picked;
             }
         }
@@ -472,16 +545,16 @@ impl MailPro {
 
     /// 把选中的邮件移到 `to`，None 为彻底删除：先从本地删掉，再让引擎在服务器上移。账号没连上时不动
     fn move_picked(&mut self, to: Option<Folder>, window: &mut Window, cx: &mut Context<Self>) {
-        let Some((account, folder)) = self.sel else { return };
+        let (account, folder) = self.picked_in;
         let Some(f) = self.folder(account, folder) else { return };
         if self.accounts.iter().any(|a| a.acc.id == account && a.error.is_some()) {
             return window.push_notification(Notification::error(t(cx).offline), cx);
         }
-        let uids: Vec<u32> = self.headers.iter().filter(|h| self.picked.contains(&h.uid)).map(|h| h.uid).collect();
+        let uids: Vec<u32> = self.headers.iter().filter(|h| self.is_picked(h)).map(|h| h.uid).collect();
         if uids.is_empty() || self.db.remove(folder, &uids).is_err() {
             return;
         }
-        self.headers.retain(|h| !self.picked.contains(&h.uid));
+        self.headers.retain(|h| h.folder != folder || !self.picked.contains(&h.uid));
         if self.reading.as_ref().is_some_and(|r| r.folder == folder && self.picked.contains(&r.uid)) {
             self.reading = None;
         }
@@ -511,7 +584,7 @@ impl MailPro {
             }
             Event::Changed { account, folder } => {
                 self.reload_folders(account);
-                if self.sel == Some((account, folder)) {
+                if self.mixed || self.sel == Some((account, folder)) {
                     self.load(cx);
                 }
             }
@@ -652,8 +725,9 @@ impl MailPro {
         .detach();
     }
 
-    fn set_language(&mut self, t: &'static T, cx: &mut Context<Self>) {
+    fn set_language(&mut self, t: &'static T, window: &mut Window, cx: &mut Context<Self>) {
         cx.set_global(Lang(t));
+        self.query.update(cx, |q, cx| q.set_placeholder(t.search, window, cx));
         let _ = self.db.set_setting("language", t.code);
         cx.refresh_windows();
     }
@@ -773,7 +847,11 @@ impl MailPro {
                     .child(Icon::new(folder_icon(f)).small().text_color(if selected { theme.link } else { theme.muted_foreground }))
                     .child(div().flex_1().truncate().child(folder_label(t, f)))
                     .when(*unread > 0, |d| d.child(div().text_xs().text_color(theme.muted_foreground).child(unread.to_string())))
-                    .on_click(cx.listener(move |v, _, _, cx| v.select(id, fid, cx)))
+                    // 点文件夹就不再搜索
+                    .on_click(cx.listener(move |v, _, window, cx| {
+                        v.query.update(cx, |q, cx| q.clean(window, cx));
+                        v.select(id, fid, cx)
+                    }))
             });
             let target = theme.list_active;
             v_flex()
@@ -841,8 +919,8 @@ impl MailPro {
                     .child(Button::new("language").ghost().small().icon(IconName::Languages).tooltip(t.language).dropdown_menu(move |menu, _, _| {
                         let item = |lang: &'static T, label: &'static str| {
                             let view = view.clone();
-                            PopupMenuItem::new(label).checked(t.code == lang.code).on_click(move |_, _, cx| {
-                                let _ = view.update(cx, |v, cx| v.set_language(lang, cx));
+                            PopupMenuItem::new(label).checked(t.code == lang.code).on_click(move |_, window, cx| {
+                                let _ = view.update(cx, |v, cx| v.set_language(lang, window, cx));
                             })
                         };
                         // 选项文字固定，不随界面语言变
@@ -854,14 +932,19 @@ impl MailPro {
     fn row(&self, i: usize, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let (t, theme) = (t(cx), cx.theme());
         let h = &self.headers[i];
-        let uid = h.uid;
+        let (folder, uid) = (h.folder, h.uid);
         let unread = h.flags & store::SEEN == 0;
-        let picked = self.picked.contains(&uid);
+        let picked = self.is_picked(h);
         let from = if h.from_name.is_empty() { &h.from_addr } else { &h.from_name };
         let view = cx.entity().downgrade();
         let subject = if h.subject.is_empty() { t.no_subject.to_string() } else { h.subject.clone() };
+        // 按全部文件夹搜时标出在哪个文件夹，多个账号时再带上邮箱
+        let place = self.mixed.then(|| self.locate(folder)).flatten().map(|(a, f)| {
+            let name = folder_label(t, f);
+            if self.accounts.len() > 1 { format!("{name} · {}", a.acc.email) } else { name }
+        });
         v_flex()
-            .id(("message", uid as usize))
+            .id(("message", i))
             .relative()
             .w_full()
             .h(px(ROW))
@@ -887,12 +970,16 @@ impl MailPro {
                     .text_sm()
                     .text_color(theme.muted_foreground)
                     .child(div().flex_1().truncate().child(subject))
+                    .children(place.map(|p| div().flex_none().max_w(px(180.)).truncate().text_xs().child(p)))
                     .when(h.attach, |d| d.child(Icon::new(IconName::Paperclip).xsmall()))
                     .when(h.flags & store::FLAGGED != 0, |d| d.child(Icon::new(IconName::StarFill).xsmall().text_color(theme.warning))),
             )
-            .on_click(cx.listener(move |v, e: &ClickEvent, _, cx| v.click(uid, e.modifiers(), cx)))
+            .on_click(cx.listener(move |v, e: &ClickEvent, _, cx| v.click(folder, uid, e.modifiers(), cx)))
             // 右键没选中的行先选中它；菜单下一帧才建，那时已选好
-            .on_mouse_down(MouseButton::Right, cx.listener(move |v, _, _, cx| if !v.picked.contains(&uid) { v.click(uid, Modifiers::none(), cx) }))
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |v, _, _, cx| if !(v.picked_in.1 == folder && v.picked.contains(&uid)) { v.click(folder, uid, Modifiers::none(), cx) }),
+            )
             .context_menu(move |menu, _, cx| {
                 let Some(view) = view.upgrade() else { return menu };
                 // 菜单开着时正文藏起来（见 `menu` 字段），关掉时恢复
@@ -918,12 +1005,37 @@ impl MailPro {
     }
 
     fn list(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let searching = !self.query.read(cx).value().trim().is_empty();
         let unread = self.sel.and_then(|(a, f)| self.accounts.iter().find(|x| x.acc.id == a)?.folders.iter().find(|x| x.0.id == f).map(|x| x.1));
-        let all_read = unread.is_some_and(|n| n > 0).then(|| {
+        // 搜索时不给：它标的是整个文件夹，不只是搜到的
+        let all_read = (!searching && unread.is_some_and(|n| n > 0)).then(|| {
             let tip = t(cx).mark_all_read;
-            Button::new("all-read").ghost().xsmall().icon(IconName::CheckCheck).tooltip(tip).on_click(cx.listener(|v, _, _, cx| v.mark(store::SEEN, true, |_| true, cx)))
+            Button::new("all-read").ghost().xsmall().icon(IconName::CheckCheck).tooltip(tip).on_click(cx.listener(|v, _, _, cx| {
+                if let Some(sel) = v.sel {
+                    v.mark(sel, store::SEEN, true, |_| true, cx);
+                }
+            }))
         });
+        let scope = Button::new("scope")
+            .ghost()
+            .xsmall()
+            .label(if self.search_all { t(cx).everywhere } else { t(cx).this_folder })
+            .tooltip(t(cx).search_scope)
+            .on_click(cx.listener(|v, _, _, cx| {
+                v.search_all = !v.search_all;
+                v.scroll.scroll_to_item(0, ScrollStrategy::Top);
+                v.load(cx);
+            }));
         let (t, theme) = (t(cx), cx.theme());
+        let search = h_flex()
+            .flex_none()
+            .h(px(40.))
+            .px_2()
+            .gap_1()
+            .border_b_1()
+            .border_color(theme.border)
+            .child(Input::new(&self.query).small().flex_1().prefix(Icon::new(IconName::Search).small()).cleanable(true))
+            .child(scope);
         let empty = self.headers.is_empty() && self.sel.is_some();
         let rows = uniform_list(
             "messages",
@@ -934,7 +1046,10 @@ impl MailPro {
         .size_full();
         // 顶部标题：文件夹、所属账号、封数，多个邮箱时知道在看哪个
         let head = self.sel.and_then(|(a, f)| {
-            let email = self.accounts.iter().find(|x| x.acc.id == a)?.acc.email.clone();
+            let (title, email) = match self.mixed {
+                true => (t.everywhere.to_string(), String::new()),
+                false => (folder_label(t, &self.folder(a, f)?), self.accounts.iter().find(|x| x.acc.id == a)?.acc.email.clone()),
+            };
             let muted = |s: String| div().text_xs().text_color(theme.muted_foreground).child(s);
             Some(
                 h_flex()
@@ -944,18 +1059,25 @@ impl MailPro {
                     .gap_2()
                     .border_b_1()
                     .border_color(theme.border)
-                    .child(div().flex_none().font_family(DISPLAY).font_weight(FontWeight::BOLD).child(folder_label(t, &self.folder(a, f)?)))
+                    .child(div().flex_none().font_family(DISPLAY).font_weight(FontWeight::BOLD).child(title))
                     .child(muted(email).flex_1().truncate())
                     .child(muted(format!("{}{}", self.headers.len(), t.messages)).flex_none())
                     .children(all_read),
             )
         });
-        v_flex().size_full().bg(theme.background).children(head).child(
+        v_flex().size_full().bg(theme.background).when(self.sel.is_some(), |d| d.child(search)).children(head).child(
             div()
                 .flex_1()
                 .min_h_0()
                 .relative()
-                .when(empty, |d| d.flex().items_center().justify_center().font_family(PROSE).text_color(theme.muted_foreground).child(t.no_messages))
+                .when(empty, |d| {
+                    d.flex()
+                        .items_center()
+                        .justify_center()
+                        .font_family(PROSE)
+                        .text_color(theme.muted_foreground)
+                        .child(if searching { t.no_results } else { t.no_messages })
+                })
                 .when(!empty, |d| d.child(rows).vertical_scrollbar(&self.scroll)),
         )
     }
