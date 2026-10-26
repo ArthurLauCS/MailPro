@@ -3,7 +3,7 @@ param([string]$Exe, [string]$Arguments = '', [string]$Steps, [string]$OutDir, [s
 # stderr going to <OutDir>\app.log, with LOCALAPPDATA (WebView2 data) at a scratch dir, and runs steps with posted
 # messages (the real mouse and keyboard are not touched):
 #   powershell -File scripts/drive.ps1 -Exe target/debug/mailpro.exe -Arguments tests/privacy/tracking.eml -Steps "wait 3000; shot a" -OutDir <dir> -LocalAppData <scratch dir>
-# Steps, separated by ';': wait <ms> | click <x> <y> | wheel <x> <y> <notches> | type <ascii, no spaces> | shot <name>
+# Steps, separated by ';': wait <ms> | click <x> <y> | rclick <x> <y> | wheel <x> <y> <notches> | type <ascii, no spaces> | shot <name>
 # Coordinates are client DIPs of the main window; clicks and wheel go to the deepest child window under the
 # point, so they reach the WebView2 body. The process tree started here is killed at the end.
 Add-Type -AssemblyName System.Drawing
@@ -62,11 +62,13 @@ foreach ($step in $Steps.Split(';')) {
   $a = $step.Trim().Split(' ')
   switch ($a[0]) {
     'wait' { Start-Sleep -Milliseconds ([int]$a[1]) }
-    'click' {
+    { $_ -eq 'click' -or $_ -eq 'rclick' } {
       $t = Target $a[1] $a[2]; $l = MakeLParam $t[1].X $t[1].Y
+      # WM_LBUTTONDOWN + MK_LBUTTON, or WM_RBUTTONDOWN + MK_RBUTTON; the up message follows the down
+      $b = if ($a[0] -eq 'click') { @(0x201, 1) } else { @(0x204, 2) }
       [void][D]::PostMessage($t[0], 0x200, 0, $l); Start-Sleep -Milliseconds 60
-      [void][D]::PostMessage($t[0], 0x201, 1, $l); Start-Sleep -Milliseconds 40
-      [void][D]::PostMessage($t[0], 0x202, 0, $l); Start-Sleep -Milliseconds 400
+      [void][D]::PostMessage($t[0], $b[0], $b[1], $l); Start-Sleep -Milliseconds 40
+      [void][D]::PostMessage($t[0], $b[0] + 1, 0, $l); Start-Sleep -Milliseconds 400
     }
     'wheel' {
       $t = Target $a[1] $a[2]

@@ -64,7 +64,8 @@ CREATE INDEX IF NOT EXISTS message_date ON message (folder, date);
 CREATE TABLE IF NOT EXISTS body (
     folder INTEGER NOT NULL, uid INTEGER NOT NULL, raw BLOB NOT NULL, PRIMARY KEY (folder, uid),
     FOREIGN KEY (folder, uid) REFERENCES message ON DELETE CASCADE);
--- 本地改了、还没写回服务器的已读状态；邮件在服务器上删掉时跟着删
+-- 本地改了、还没写回服务器的标记：mask 是改过的标记位，bits 是它们的新值（第 3 条迁移把 seen 改名为 bits、加 mask）；
+-- 邮件在服务器上删掉时跟着删
 CREATE TABLE IF NOT EXISTS pending (
     folder INTEGER NOT NULL, uid INTEGER NOT NULL, seen INTEGER NOT NULL, PRIMARY KEY (folder, uid),
     FOREIGN KEY (folder, uid) REFERENCES message ON DELETE CASCADE);
@@ -75,7 +76,12 @@ CREATE TABLE IF NOT EXISTS image_sender (addr TEXT PRIMARY KEY) WITHOUT ROWID;
 ";
 
 /// 建表之后按顺序执行，`PRAGMA user_version` 记已执行的条数；只能往后加
-const MIGRATIONS: &[&str] = &["ALTER TABLE account ADD COLUMN proxy TEXT", "ALTER TABLE folder ADD COLUMN role TEXT"];
+const MIGRATIONS: &[&str] = &[
+    "ALTER TABLE account ADD COLUMN proxy TEXT",
+    "ALTER TABLE folder ADD COLUMN role TEXT",
+    // 原有的行只记已读：seen 的 0 / 1 正好是 SEEN 位的值
+    "ALTER TABLE pending RENAME COLUMN seen TO bits; ALTER TABLE pending ADD COLUMN mask INTEGER NOT NULL DEFAULT 1",
+];
 
 pub struct Store(Connection);
 
@@ -256,7 +262,7 @@ impl Store {
         Ok(n)
     }
 
-    /// 删掉服务器上已经没有的邮件，返回删掉的封数
+    /// 删掉本地的这些邮件（服务器上已经没有，或界面上刚移走），返回删掉的封数
     pub fn remove(&self, folder: i64, uids: &[u32]) -> Result<usize> {
         let tx = self.0.unchecked_transaction()?;
         let mut n = 0;
@@ -288,32 +294,40 @@ impl Store {
         .collect()
     }
 
-    /// 本地标已读 / 未读，同时记一条待写回，下次同步这个文件夹时写回服务器
-    pub fn mark_seen(&self, folder: i64, uid: u32, seen: bool) -> Result<()> {
+    /// 本地设上 / 去掉一个标记（[`SEEN`]、[`FLAGGED`]），同时记待写回，下次同步这个文件夹时写回服务器
+    pub fn mark(&self, folder: i64, uids: &[u32], flag: u8, on: bool) -> Result<()> {
         let tx = self.0.unchecked_transaction()?;
-        tx.execute(
-            "UPDATE message SET flags = CASE WHEN ?3 THEN flags | 1 ELSE flags & ~1 END
-             WHERE folder = ?1 AND uid = ?2",
-            params![folder, uid, seen],
-        )?;
-        tx.execute("INSERT OR REPLACE INTO pending VALUES (?1, ?2, ?3)", params![folder, uid, seen])?;
+        let bits = if on { flag } else { 0 };
+        {
+            let mut set = tx.prepare("UPDATE message SET flags = flags & ~?3 | ?4 WHERE folder = ?1 AND uid = ?2")?;
+            let mut add = tx.prepare(
+                "INSERT INTO pending (folder, uid, bits, mask) VALUES (?1, ?2, ?4, ?3)
+                 ON CONFLICT DO UPDATE SET bits = bits & ~?3 | ?4, mask = mask | ?3",
+            )?;
+            for uid in uids {
+                set.execute(params![folder, uid, flag, bits])?;
+                add.execute(params![folder, uid, flag, bits])?;
+            }
+        }
         tx.commit()
     }
 
-    /// (uid, 已读)
-    pub fn pending(&self, folder: i64) -> Result<Vec<(u32, bool)>> {
-        let mut st = self.0.prepare("SELECT uid, seen FROM pending WHERE folder = ?1")?;
-        st.query_map([folder], |r| Ok((r.get(0)?, r.get(1)?)))?.collect()
+    /// (uid, 改过的标记位, 它们的新值)
+    pub fn pending(&self, folder: i64) -> Result<Vec<(u32, u8, u8)>> {
+        let mut st = self.0.prepare("SELECT uid, mask, bits FROM pending WHERE folder = ?1")?;
+        st.query_map([folder], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.collect()
     }
 
-    /// 写回成功后删掉；写回期间又被改过的留到下次
-    pub fn clear_pending(&self, folder: i64, uids: &[u32], seen: bool) -> Result<()> {
+    /// 标记 `flag` 已写回成 `on`，从待写回里去掉；写回期间又被改过的留到下次
+    pub fn clear_pending(&self, folder: i64, uids: &[u32], flag: u8, on: bool) -> Result<()> {
         let tx = self.0.unchecked_transaction()?;
         for uid in uids {
             tx.execute(
-                "DELETE FROM pending WHERE folder = ?1 AND uid = ?2 AND seen = ?3",
-                params![folder, uid, seen],
+                "UPDATE pending SET mask = mask & ~?3, bits = bits & ~?3
+                 WHERE folder = ?1 AND uid = ?2 AND (bits & ?3 <> 0) = ?4",
+                params![folder, uid, flag, on],
             )?;
+            tx.execute("DELETE FROM pending WHERE folder = ?1 AND uid = ?2 AND mask = 0", params![folder, uid])?;
         }
         tx.commit()
     }
@@ -360,12 +374,22 @@ mod tests {
         assert_eq!(db.put_headers(f, &[header(1), header(2)]).unwrap(), 2);
         assert_eq!(db.put_headers(f, &[header(2), header(3)]).unwrap(), 1);
 
-        db.mark_seen(f, 1, true).unwrap();
+        db.mark(f, &[1], SEEN, true).unwrap();
+        db.mark(f, &[1], FLAGGED, true).unwrap();
         // 服务器还是未读：待写回的 1 不被覆盖，2 照常更新
         assert_eq!(db.set_flags(f, &[(1, 0), (2, SEEN | FLAGGED)]).unwrap(), 1);
         assert_eq!(db.stats(f).unwrap(), (3, 1));
-        db.clear_pending(f, &[1], false).unwrap();
-        assert_eq!(db.pending(f).unwrap(), [(1, true)]);
+        // 写回期间又取消了星标：已读清掉，星标留到下次
+        db.mark(f, &[1], FLAGGED, false).unwrap();
+        db.clear_pending(f, &[1], SEEN, false).unwrap();
+        db.clear_pending(f, &[1], SEEN, true).unwrap();
+        db.clear_pending(f, &[1], FLAGGED, true).unwrap();
+        assert_eq!(db.pending(f).unwrap(), [(1, FLAGGED, 0)]);
+        assert_eq!(db.list(f, 9).unwrap().iter().find(|h| h.uid == 1).unwrap().flags, SEEN);
+        db.clear_pending(f, &[1], FLAGGED, false).unwrap();
+        assert!(db.pending(f).unwrap().is_empty());
+        db.mark(f, &[1], SEEN, false).unwrap();
+        assert_eq!(db.pending(f).unwrap(), [(1, SEEN, 0)]);
 
         // 删邮件连带待写回和正文
         db.put_body(f, 1, b"raw").unwrap();
