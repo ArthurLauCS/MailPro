@@ -22,13 +22,13 @@ Checks behind these claims: a test message carrying 31 tracking techniques trigg
 
 ## Download and install
 
-**[Download the installer](https://github.com/ArthurLauCS/MailPro/releases/download/v0.1.0/MailPro-Setup-0.1.0.exe)** · [SHA256 checksums](https://github.com/ArthurLauCS/MailPro/releases/download/v0.1.0/SHA256SUMS.txt)
+**[Download the installer](https://github.com/ArthurLauCS/MailPro/releases/download/v0.2.0/MailPro-Setup-0.2.0.exe)** · [SHA256 checksums](https://github.com/ArthurLauCS/MailPro/releases/download/v0.2.0/SHA256SUMS.txt)
 
-Run `MailPro-Setup-0.1.0.exe` from [GitHub Releases](https://github.com/ArthurLauCS/MailPro/releases/tag/v0.1.0). It installs for the current user under `%LOCALAPPDATA%\Programs\MailPro` and needs no administrator rights.
+Run `MailPro-Setup-0.2.0.exe` from [GitHub Releases](https://github.com/ArthurLauCS/MailPro/releases/tag/v0.2.0). It installs for the current user under `%LOCALAPPDATA%\Programs\MailPro` and needs no administrator rights.
 
 - Windows 10 / 11 x64 with the [WebView2 Runtime](https://developer.microsoft.com/microsoft-edge/webview2/) (included in Windows 11 and in up-to-date Windows 10).
 - The installer offers English and Simplified Chinese; the app's language is chosen separately in the app.
-- The installer is unsigned, so Windows SmartScreen may warn about an unknown publisher: choose **More info → Run anyway**. Check the file against `SHA256SUMS.txt` with `Get-FileHash .\MailPro-Setup-0.1.0.exe -Algorithm SHA256`.
+- The installer is unsigned, so Windows SmartScreen may warn about an unknown publisher: choose **More info → Run anyway**. Check the file against `SHA256SUMS.txt` with `Get-FileHash .\MailPro-Setup-0.2.0.exe -Algorithm SHA256`.
 
 Mail and settings are stored in `%LOCALAPPDATA%\MailPro`; passwords and Outlook sign-in tokens are stored in Windows Credential Manager. Uninstalling removes both.
 

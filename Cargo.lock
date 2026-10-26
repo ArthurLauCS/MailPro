@@ -3554,7 +3554,7 @@ dependencies = [
 
 [[package]]
 name = "mailpro"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "chrono",
  "futures",
@@ -3571,7 +3571,7 @@ dependencies = [
 
 [[package]]
 name = "mailpro-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "ammonia",
  "async-imap",
