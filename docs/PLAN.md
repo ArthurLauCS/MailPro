@@ -43,7 +43,7 @@ tests/privacy  跟踪测试邮件 + 本地计数服务器
    - 验证：清洗的单元测试通过；`tests/privacy/tracking.eml` 含 30 多种跟踪手段，无防护的 headless Chrome 打开后计数服务器收到 31 种；MailPro 打开同一封，命中 0；内嵌图片、中文排版正常；点链接被拦下，只把原地址报给界面。
    - 复现：`python tests/privacy/tracker.py serve <log>` 起计数服务器，再用 `scripts/drive.ps1` 不抢焦点地启动并截图（用法见脚本头部）。
 2. **账号与 IMAP 同步**（已完成）：Gmail（应用专用密码）、Outlook / Hotmail（浏览器登录，XOAUTH2）、其他 IMAP 邮箱（手填服务器，只走 TLS）；SQLite 存邮件头和标记；IDLE 实时推送；已读标记回写服务器。
-   - 同步规则：全部文件夹的邮件头全量同步；Gmail 按 IMAP 文件夹原样存（All Mail 也同步，不去重）；首次同步从新到旧分批拉，断了下次接着补；收件箱 IDLE 实时，全部文件夹每 5 分钟同步一次；服务器支持 CONDSTORE 时只拉改过的标记。列表不显示正文摘要。正文按需下载，原始邮件存进 SQLite，不清理。标已读先改本地并记待写回，同步该文件夹时写回，邮件已被删就丢弃。断线重连从 5 秒起翻倍，封顶 5 分钟，一直重试。
+   - 同步规则：全部文件夹的邮件头全量同步；Gmail 按 IMAP 文件夹原样存（All Mail 也同步，不去重）；首次同步从新到旧分批拉，断了下次接着补；收件箱 IDLE 实时，IDLE 安静 25 秒就结束再重新发起（有的代理约 60 秒掐断空闲连接，实测 Clash 上游的 ISP SOCKS5 如此），全部文件夹每 5 分钟同步一次；服务器支持 CONDSTORE 时只拉改过的标记。列表不显示正文摘要。正文按需下载，原始邮件存进 SQLite，不清理。标已读先改本地并记待写回，同步该文件夹时写回，邮件已被删就丢弃。断线重连从 5 秒起翻倍，封顶 5 分钟，一直重试。
    - 代码：`crates/core` 的 `store`（SQLite，`%LOCALAPPDATA%\MailPro\mail.db`）、`imap`（同步、IDLE）、`cred`（凭据管理器）、`auth`（Outlook 登录和令牌）；验证工具 `mailpro-cli`（用法见文件头）。
    - 验证：两个真实账号的收件箱与网页版一致；一边标已读，另一边几秒内变化。本地部分由 `crates/core/tests/sync.rs` 对 GreenMail 测试服务器验证（跑法见文件头）；GreenMail 不推送其他连接改的标记，“另一边几秒内变化”只能用真实账号验证。
    - 现状：Gmail 和手填服务器部分已完成，真实 Gmail 验证通过：各文件夹数量与网页版一致；本地标已读 2 秒内写回；网页改标记、新信进收件箱都在几秒内推到本地；其他文件夹随 5 分钟同步跟上；Gmail 支持 CONDSTORE，只拉改过的标记。Gmail 自填 OAuth client 不在这一步。

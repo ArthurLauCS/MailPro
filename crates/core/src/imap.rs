@@ -3,6 +3,7 @@
 
 use crate::auth::{Expired, Secret};
 use crate::store::{self, Account, Folder, Header, Store};
+use async_imap::extensions::idle::IdleResponse;
 use async_imap::imap_proto::{BodyStructure, NameAttribute};
 use async_imap::types::{Fetch, Flag, Name};
 use futures::TryStreamExt;
@@ -25,6 +26,8 @@ pub type Session<T = TlsStream<TcpStream>> = async_imap::Session<T>;
 
 /// 全部文件夹多久同步一次；收件箱另靠 IDLE 实时
 const POLL: Duration = Duration::from_secs(5 * 60);
+/// IDLE 多久没动静就结束再重新发起：有的代理掐断空闲约 60 秒的连接（实测 Clash 上游的 ISP SOCKS5）
+const KEEP: Duration = Duration::from_secs(25);
 /// 断线重连等待：从 5 秒起每次翻倍，封顶 5 分钟
 const RETRY_MIN: Duration = Duration::from_secs(5);
 const RETRY_MAX: Duration = Duration::from_secs(5 * 60);
@@ -228,7 +231,7 @@ pub async fn fetch_body<T: Io>(s: &mut Session<T>, db: &Store, f: &Folder, uid: 
     Ok(Some(raw.to_vec()))
 }
 
-/// 一直保持同步：每 [`POLL`] 同步全部文件夹，其间在收件箱上 IDLE，收件箱一有变化立即同步。
+/// 一直保持同步：每 [`POLL`] 同步全部文件夹，其间在收件箱上 IDLE（每 [`KEEP`] 重新发起一次，连接不会闲着），收件箱一有变化立即同步。
 /// 断线后等 [`RETRY_MIN`] 起翻倍、封顶 [`RETRY_MAX`] 再重连，一直重试；只有 Outlook 授权失效时停下。
 pub async fn watch(db: &Store, acc: &Account, secret: &Secret, mut on: impl FnMut(Event)) {
     let mut delay = RETRY_MIN;
@@ -265,13 +268,15 @@ pub async fn watch_session<T: Io>(
         loop {
             let mut idle = s.idle();
             idle.init().await?;
-            let (wait, _stop) = idle.wait_with_timeout(POLL);
+            let (wait, _stop) = idle.wait_with_timeout(KEEP);
             // 服务器的保活消息会重置 wait 自己的超时，所以另设截止时间
             let woke = timeout_at(next, wait).await;
             s = idle.done().await?;
             let Ok(r) = woke else { break };
-            // 新数据，或连接被关（下面的同步会报错，转去重连）
-            r?;
+            // 安静了 KEEP：重新 IDLE；否则是新数据，或连接被关（下面的同步会报错，转去重连）
+            if matches!(r?, IdleResponse::Timeout) {
+                continue;
+            }
             let inbox = db.folders(acc.id)?.into_iter().find(|f| f.name.eq_ignore_ascii_case("INBOX"));
             let inbox = inbox.ok_or("服务器没有收件箱")?;
             let ch = sync_folder(&mut s, db, &inbox).await?;
