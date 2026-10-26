@@ -15,7 +15,7 @@ A privacy-focused desktop mail client for Windows, written in Rust with a native
 5. **Safe links.** Clicking a link shows the cleaned address first: known redirect wrappers (Google, Outlook SafeLinks, Facebook and others) are unwrapped and tracking parameters removed, with the original address listed next to it. Open it in the system browser, a program you choose, or an [AdsPower](https://www.adspower.com/) profile, which is started through AdsPower's local API so its fingerprint and proxy apply.
 6. **Gmail and other IMAP accounts.** Gmail signs in with an app password; other providers with a manually entered IMAP server over TLS. Read status lives on the server, so several computers stay in sync: marking a message read is written back within seconds, and changes made elsewhere reach the inbox within seconds (IDLE) and other folders within five minutes.
 7. **Fast with large folders.** Headers of every folder are synced in full and kept in a local SQLite database; bodies are downloaded when opened. A folder of 50,000 messages scrolls at a median frame time of 2.8 ms.
-8. **No telemetry, no crash reporting.** English and Simplified Chinese; light and dark themes follow the system.
+8. **No telemetry, no crash reporting.** English and Simplified Chinese; light and dark themes follow the system, and dark mode darkens message bodies too.
 
 Checks behind these claims: a test message carrying 31 tracking techniques triggers all 31 in an unprotected headless Chrome and none in MailPro; the [emailprivacytester.com](https://www.emailprivacytester.com/) test shows no new hits until images are loaded, and then only the proxy's address; during ten minutes of use the WebView2 processes opened no outside connection.
 
@@ -36,6 +36,7 @@ Mail and settings are stored in `%LOCALAPPDATA%\MailPro`; passwords are stored i
 1. **Add account** (bottom of the left column): enter the address, an app password and, recommended, a SOCKS5 proxy such as `127.0.0.1:7890`. For Gmail, turn on 2-Step Verification and create an app password at [myaccount.google.com/apppasswords](https://myaccount.google.com/apppasswords). For other providers, also enter the IMAP server and port (TLS only).
 2. Opening a message marks it read on the server. The reader header lists the blocked remote content; **Load images** loads it for this message, **Always load images from this sender** for every message from that address.
 3. **Browser** (bottom of the left column) chooses where links open. For AdsPower, enter the profile ID and the API key from AdsPower's API settings; the key is kept in Credential Manager.
+4. Drag an account row onto another account to reorder them. An account row glows softly while its inbox has mail received in the last 30 minutes.
 
 ## Current limits
 
@@ -46,6 +47,7 @@ Version 0.1.0 reads mail. Not yet available: deleting, archiving, moving and sta
 Requires Rust stable with the MSVC C++ tools; [Inno Setup 6](https://jrsoftware.org/isinfo.php) for the installer.
 
 ```powershell
+.\scripts\fonts.ps1                           # downloads the two bundled fonts (not in git); without them the UI uses system fonts
 cargo run -p mailpro                          # the app
 cargo run -p mailpro -- C:\path\to\message.eml  # shows one message file
 cargo test --workspace

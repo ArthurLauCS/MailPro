@@ -42,6 +42,9 @@ def rust_packages():
 
 def main():
     entries = rust_packages()
+    assets = ROOT / "crates" / "app" / "assets"
+    entries.append(("Noto Serif SC (font) 2.003", "", "https://github.com/notofonts/noto-cjk", "OFL-1.1", [assets / "OFL-NotoSerifSC.txt"]))
+    entries.append(("LXGW WenKai (font) 1.530", "", "https://github.com/lxgw/LxgwWenKai", "OFL-1.1", [assets / "OFL-LXGWWenKai.txt"]))
     texts: dict[str, int] = {}
     blocks = []
     for name, version, repo, license, files in entries:
@@ -55,7 +58,7 @@ def main():
             lines.append(f"{f.name}: License text {n}")
         blocks.append("\n".join(lines))
     head = ("MailPro - Third-party notices\n\n"
-            "These notices cover the Rust dependencies built into MailPro (including build dependencies). "
+            "These notices cover the Rust dependencies built into MailPro (including build dependencies) and bundled fonts. "
             "They do not license MailPro itself. Identical license texts are included once and referenced below.")
     bar = "=" * 72
     bodies = [f"{bar}\nLicense text {n}\n{bar}\n\n{text}" for text, n in texts.items()]

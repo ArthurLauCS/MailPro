@@ -2,6 +2,7 @@
 
 mod browser;
 mod i18n;
+mod theme;
 mod view;
 mod webview;
 
@@ -10,6 +11,21 @@ use gpui::{App, Bounds, TitlebarOptions, WindowBackgroundAppearance, WindowBound
 use gpui_component::Root;
 use mailpro_core::store::{self, Store};
 use mailpro_core::{cred, message};
+use std::borrow::Cow;
+use std::path::PathBuf;
+
+/// 两套中文字体：安装版在 exe 旁的 fonts 目录，开发时在 crates/app/assets/fonts（scripts/fonts.ps1 下载）。
+/// 找不到时不报错，界面退回系统字体。
+fn load_fonts(cx: &mut App) {
+    let exe = std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.join("fonts")));
+    let dev = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets/fonts");
+    let fonts: Vec<Cow<'static, [u8]>> = ["NotoSerifSC-VF.ttf", "LXGWWenKai-Regular.ttf"]
+        .iter()
+        .filter_map(|name| exe.iter().chain([&dev]).find_map(|dir| std::fs::read(dir.join(name)).ok()))
+        .map(Cow::Owned)
+        .collect();
+    let _ = cx.text_system().add_fonts(fonts);
+}
 
 fn main() {
     // 卸载程序调用：删掉凭据管理器里本程序存的密码，数据目录由卸载程序自己删
@@ -23,6 +39,7 @@ fn main() {
     // 默认的 Assets 只带组件自用的百来个图标，文件夹、附件等图标要全套 Lucide
     gpui_platform::application().with_assets(gpui_kit_assets::AllAssets).run(move |cx: &mut App| {
         gpui_component::init(cx);
+        load_fonts(cx);
         cx.set_global(i18n::Lang(i18n::initial(db.setting("language").ok().flatten().as_deref())));
         let bounds = Bounds::centered(None, size(px(1280.), px(800.)), cx);
         let options = WindowOptions {

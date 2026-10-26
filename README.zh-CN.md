@@ -15,7 +15,7 @@
 5. **安全打开链接。** 点链接先显示清洗后的地址：拆掉已知的跳转壳（Google、Outlook SafeLinks、Facebook 等），去掉跟踪参数，原地址另列一行。可以用系统默认浏览器、自选程序或 [AdsPower](https://www.adspower.com/) 环境打开；AdsPower 环境经它的本地 API 启动，指纹和代理照常生效。
 6. **Gmail 和其他 IMAP 邮箱。** Gmail 用应用专用密码登录；其他邮箱手填 IMAP 服务器，只走 TLS。已读状态存在服务器上，多台电脑自动一致：本地标已读几秒内写回；别处的改动几秒内推到收件箱（IDLE），其他文件夹 5 分钟内跟上。
 7. **大文件夹也流畅。** 全部文件夹的邮件头全量同步，存在本地 SQLite 里；正文打开时才下载。5 万封的文件夹滚动时每帧耗时中位 2.8 ms。
-8. **无遥测、无崩溃上报。** 界面中英双语，深浅色跟随系统。
+8. **无遥测、无崩溃上报。** 界面中英双语，深浅色跟随系统，深色时邮件正文也变深。
 
 这些说法的验证：一封含 31 种跟踪手段的测试邮件，在无防护的 headless Chrome 里 31 种全部触发，在 MailPro 里一种都没有；[emailprivacytester.com](https://www.emailprivacytester.com/) 的测试在加载图片前没有任何新记录，加载后也只多出代理的 IP；使用十分钟内 WebView2 进程没有任何对外连接。
 
@@ -36,6 +36,7 @@
 1. 左栏底部 **添加账号**：填邮箱、应用专用密码，建议再填 SOCKS5 代理，如 `127.0.0.1:7890`。Gmail 需先开启两步验证，再到 [myaccount.google.com/apppasswords](https://myaccount.google.com/apppasswords) 创建应用专用密码。其他邮箱还要填 IMAP 服务器和端口（只支持 TLS）。
 2. 打开邮件即在服务器上标为已读。阅读区头部列出拦下的远程资源；**加载图片** 只对这一封生效，**总是加载此发件人的图片** 对该地址的所有邮件生效。
 3. 左栏底部 **浏览器** 选择链接用什么打开。选 AdsPower 时填环境 ID 和 AdsPower API 设置里的 API key；key 存在凭据管理器里。
+4. 把账号行拖到另一个账号上即可调整顺序。收件箱最近 30 分钟内收到过邮件时，账号行会微微泛光。
 
 ## 当前限制
 
@@ -46,6 +47,7 @@
 需要 Rust stable 和 MSVC C++ 工具；打安装包需要 [Inno Setup 6](https://jrsoftware.org/isinfo.php)。
 
 ```powershell
+.\scripts\fonts.ps1                           # 下载打包的两套字体（不进 git）；没有时界面用系统字体
 cargo run -p mailpro                          # 运行软件
 cargo run -p mailpro -- C:\path\to\message.eml  # 只显示一封邮件文件
 cargo test --workspace
