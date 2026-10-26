@@ -35,6 +35,8 @@ pub struct Folder {
 }
 
 pub struct Header {
+    /// 所在文件夹；[`Store::put_headers`] 不看它，按参数存
+    pub folder: i64,
     pub uid: u32,
     pub flags: u8,
     /// 服务器收到的时间（INTERNALDATE），Unix 秒
@@ -84,6 +86,23 @@ const MIGRATIONS: &[&str] = &[
 ];
 
 pub struct Store(Connection);
+
+/// 读 [`Header`] 的列，和 [`header`] 的下标对应
+const HEADER: &str = "folder, uid, flags, date, size, attach, from_name, from_addr, subject";
+
+fn header(r: &rusqlite::Row) -> Result<Header> {
+    Ok(Header {
+        folder: r.get(0)?,
+        uid: r.get(1)?,
+        flags: r.get(2)?,
+        date: r.get(3)?,
+        size: r.get(4)?,
+        attach: r.get(5)?,
+        from_name: r.get(6)?,
+        from_addr: r.get(7)?,
+        subject: r.get(8)?,
+    })
+}
 
 /// `%LOCALAPPDATA%\MailPro\mail.db`，目录不存在就建
 pub fn path() -> std::io::Result<String> {
@@ -275,23 +294,19 @@ impl Store {
 
     /// 最新的 `limit` 封
     pub fn list(&self, folder: i64, limit: u32) -> Result<Vec<Header>> {
-        let mut st = self.0.prepare(
-            "SELECT uid, flags, date, size, attach, from_name, from_addr, subject FROM message
-             WHERE folder = ?1 ORDER BY date DESC LIMIT ?2",
-        )?;
-        st.query_map(params![folder, limit], |r| {
-            Ok(Header {
-                uid: r.get(0)?,
-                flags: r.get(1)?,
-                date: r.get(2)?,
-                size: r.get(3)?,
-                attach: r.get(4)?,
-                from_name: r.get(5)?,
-                from_addr: r.get(6)?,
-                subject: r.get(7)?,
-            })
-        })?
-        .collect()
+        let mut st = self.0.prepare(&format!("SELECT {HEADER} FROM message WHERE folder = ?1 ORDER BY date DESC LIMIT ?2"))?;
+        st.query_map(params![folder, limit], header)?.collect()
+    }
+
+    /// 这些文件夹里主题、发件人名字或地址含有每一个词的邮件，新的在前；不分大小写只限英文字母
+    pub fn search(&self, folders: &[i64], words: &[&str]) -> Result<Vec<Header>> {
+        let ids: Vec<String> = folders.iter().map(i64::to_string).collect();
+        let mut sql = format!("SELECT {HEADER} FROM message WHERE folder IN ({})", ids.join(","));
+        for i in 1..=words.len() {
+            sql += &format!(" AND (subject LIKE ?{i} ESCAPE '\\' OR from_name LIKE ?{i} ESCAPE '\\' OR from_addr LIKE ?{i} ESCAPE '\\')");
+        }
+        let like = words.iter().map(|w| format!("%{}%", w.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_")));
+        self.0.prepare(&(sql + " ORDER BY date DESC"))?.query_map(rusqlite::params_from_iter(like), header)?.collect()
     }
 
     /// 本地设上 / 去掉一个标记（[`SEEN`]、[`FLAGGED`]），同时记待写回，下次同步这个文件夹时写回服务器
@@ -350,6 +365,7 @@ mod tests {
 
     fn header(uid: u32) -> Header {
         Header {
+            folder: 0,
             uid,
             flags: 0,
             date: uid as i64,
@@ -402,5 +418,35 @@ mod tests {
         assert_eq!((db.max_uid(f).unwrap(), db.latest(f).unwrap()), (0, 0));
         db.set_folders(acc, &[]).unwrap();
         assert!(db.folders(acc).unwrap().is_empty());
+    }
+
+    #[test]
+    fn search_matches_every_word() {
+        let db = Store::open(":memory:").unwrap();
+        db.add_account(&Account { id: 0, email: "a@x".into(), host: "imap.x".into(), port: 993, proxy: None }).unwrap();
+        let acc = db.accounts().unwrap()[0].id;
+        db.set_folders(acc, &[("INBOX".into(), Some("inbox")), ("Work".into(), None)]).unwrap();
+        let id = |name: &str| db.folders(acc).unwrap().into_iter().find(|f| f.name == name).unwrap().id;
+        let (inbox, work) = (id("INBOX"), id("Work"));
+        let mail = |uid, from_name: &str, from_addr: &str, subject: &str| Header {
+            from_name: from_name.into(),
+            from_addr: from_addr.into(),
+            subject: subject.into(),
+            ..header(uid)
+        };
+        db.put_headers(inbox, &[mail(1, "Li Si", "li@x", "周报 第三周"), mail(2, "", "shop@x", "100% off_sale"), mail(3, "张三", "z@x", "周报")]).unwrap();
+        db.put_headers(work, &[mail(4, "Wang", "w@x", "项目周报")]).unwrap();
+        let uids = |folders: &[i64], words: &[&str]| db.search(folders, words).unwrap().iter().map(|h| (h.folder, h.uid)).collect::<Vec<_>>();
+
+        // 新的在前；每个词都要匹配上，可以分别在主题和发件人里
+        assert_eq!(uids(&[inbox], &["周报"]), [(inbox, 3), (inbox, 1)]);
+        assert_eq!(uids(&[inbox], &["周报", "li"]), [(inbox, 1)]);
+        assert_eq!(uids(&[inbox], &["LI@X"]), [(inbox, 1)]);
+        // % 和 _ 按字面匹配
+        assert_eq!(uids(&[inbox], &["%"]), [(inbox, 2)]);
+        assert!(uids(&[inbox], &["o_f"]).is_empty());
+        // 只搜给定的文件夹
+        assert_eq!(uids(&[inbox, work], &["周报"]), [(work, 4), (inbox, 3), (inbox, 1)]);
+        assert_eq!(uids(&[work], &["周报"]), [(work, 4)]);
     }
 }
