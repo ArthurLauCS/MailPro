@@ -1,7 +1,7 @@
 //! 第二步的验证工具：添加账号、同步、看列表、标已读、挂着 IDLE 看变化；界面在第三步。
 
 use chrono::{DateTime, Local};
-use mailpro_core::cred;
+use mailpro_core::{cred, smtp};
 use mailpro_core::imap::{self, Event, Result, folder_name};
 use mailpro_core::store::{self, Account, Folder, Store};
 use std::io::{self, Write};
@@ -92,7 +92,8 @@ async fn add(db: &Store, email: &str, rest: &[&str]) -> Result<()> {
     let mut proxy = String::new();
     io::stdin().read_line(&mut proxy)?;
     let proxy = Some(proxy.trim().to_string()).filter(|p| !p.is_empty());
-    let acc = Account { id: 0, email: email.into(), host: host.into(), port, proxy };
+    let smtp_host = smtp::default_host(host);
+    let acc = Account { email: email.into(), host: host.into(), port, proxy, smtp_host, smtp_port: 465, ..Default::default() };
     imap::connect(&acc, &secret).await?.logout().await?;
     cred::save(email, &secret)?;
     db.add_account(&acc)?;

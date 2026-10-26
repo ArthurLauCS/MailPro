@@ -5,4 +5,5 @@ pub mod imap;
 pub mod link;
 pub mod message;
 pub mod sanitize;
+pub mod smtp;
 pub mod store;

@@ -1,10 +1,11 @@
 //! 后台同步：单独一个线程跑 tokio。每个账号两条连接：一条常驻同步（IDLE + 定时同步），
-//! 一条按需连上，取正文、写回标记、移动删除，不排在同步后面。界面只发 [`Cmd`]、收 [`Event`]，
-//! 邮件头由界面自己开数据库连接读。允许加载的远程图片也在这里代取。
+//! 一条按需连上，取正文、写回标记、移动删除、存草稿和已发送，不排在同步后面。界面只发 [`Cmd`]、收 [`Event`]，
+//! 邮件头由界面自己开数据库连接读。发信、代取允许加载的远程图片也在这里，各开新连接。
 
 use crate::http;
 use crate::imap::{self, Result, Session};
 use crate::message::{self, Message};
+use crate::smtp::{self, Built};
 use crate::store::{Account, Folder, Store};
 use crate::cred;
 use futures::StreamExt;
@@ -28,7 +29,14 @@ pub enum Cmd {
     Restart(i64),
     /// 经代理取一张远程图片，回 (Content-Type, 内容)，失败回 None
     Image { url: String, proxy: Option<String>, reply: oneshot::Sender<Option<(String, Vec<u8>)>> },
+    /// 经 SMTP 发出一封，`sent` 给定时再存一份进去（Gmail 自己会存）；回发信的结果
+    Send { account: i64, mail: Built, sent: Option<Folder>, reply: Reply },
+    /// 把一封存进文件夹（草稿、已发送），再同步该文件夹；`reply` 给定时回结果，否则失败时发 [`Event::Failed`]
+    Append { account: i64, folder: Folder, raw: Vec<u8>, flags: &'static str, reply: Option<Reply> },
 }
+
+/// 发信、存草稿的结果，失败为原因
+pub type Reply = oneshot::Sender<std::result::Result<(), String>>;
 
 pub enum Event {
     /// 已连上，文件夹列表已按服务器更新
@@ -39,7 +47,7 @@ pub enum Event {
     Error { account: i64, msg: String },
     /// 添加账号的结果：账号 id 或失败原因
     Added(std::result::Result<i64, String>),
-    /// 移动 / 删除失败的原因
+    /// 移动、删除、存已发送失败的原因
     Failed(String),
 }
 
@@ -56,6 +64,7 @@ enum Job {
     Body(Folder, u32),
     Flush(Folder),
     Move(Folder, Vec<u32>, Option<Folder>),
+    Append(Folder, Vec<u8>, &'static str, Option<Reply>),
 }
 
 struct Running {
@@ -123,12 +132,26 @@ async fn run(path: String, mut cmds: UnboundedReceiver<Cmd>, again: UnboundedSen
                 });
                 continue;
             }
+            Cmd::Send { account, mail, sent, reply } => {
+                let Some(acc) = db.accounts().unwrap_or_default().into_iter().find(|a| a.id == account) else { continue };
+                let again = again.clone();
+                spawn_local(async move {
+                    let r = send(&acc, &mail).await.map_err(|e| e.to_string());
+                    if let (Ok(()), Some(folder)) = (&r, sent) {
+                        let _ = again.unbounded_send(Cmd::Append { account, folder, raw: mail.copy, flags: "(\\Seen)", reply: None });
+                    }
+                    let _ = reply.send(r);
+                });
+                continue;
+            }
+            Cmd::Append { account, folder, raw, flags, reply } => (account, Job::Append(folder, raw, flags, reply)),
         };
         match (running.get(&account), job) {
             (Some(r), job) => drop(r.jobs.unbounded_send(job)),
-            // 正文请求总要有回音，界面才不会一直显示加载中；没写回的标记改动留在库里；
+            // 正文请求、存草稿总要有回音，界面才不会一直显示加载中；没写回的标记改动留在库里；
             // 移动只在账号连着时才发
             (None, Job::Body(f, uid)) => drop(tx.unbounded_send(Event::Body { folder: f.id, uid, msg: Err(BodyError::Offline) })),
+            (None, Job::Append(.., Some(reply))) => drop(reply.send(Err("not connected".into()))),
             (None, _) => {}
         }
     }
@@ -197,16 +220,39 @@ async fn worker(db: &Store, acc: &Account, secret: &str, mut rx: UnboundedReceiv
                         let _ = tx.unbounded_send(Event::Failed(e.to_string()));
                     }
                     // 成功时同步目标文件夹，移过去的马上看得到；失败时同步原文件夹，本地先删掉的邮件回来
-                    let Some(f) = (if r.is_ok() { to } else { Some(f) }) else { continue };
-                    if let Ok(ch) = with_session(&mut slot, acc, secret, async |s| imap::sync_folder(s, db, &f).await).await
-                        && !ch.is_empty()
-                    {
-                        let _ = tx.unbounded_send(Event::Changed { account: acc.id, folder: f.id });
+                    if let Some(f) = if r.is_ok() { to } else { Some(f) } {
+                        resync(&mut slot, db, acc, secret, &f, tx).await;
+                    }
+                }
+                Job::Append(f, raw, flags, reply) => {
+                    let r = with_session(&mut slot, acc, secret, async |s| imap::append(s, &f, &raw, flags).await).await;
+                    if r.is_ok() {
+                        resync(&mut slot, db, acc, secret, &f, tx).await;
+                    }
+                    match (reply, r) {
+                        (Some(reply), r) => drop(reply.send(r.map_err(|e| e.to_string()))),
+                        (None, Err(e)) => drop(tx.unbounded_send(Event::Failed(e.to_string()))),
+                        (None, Ok(())) => {}
                     }
                 }
             }
         }
     }
+}
+
+/// 同步一个文件夹，有变化就告诉界面
+async fn resync(slot: &mut Option<Session>, db: &Store, acc: &Account, secret: &str, f: &Folder, tx: &UnboundedSender<Event>) {
+    if let Ok(ch) = with_session(slot, acc, secret, async |s| imap::sync_folder(s, db, f).await).await
+        && !ch.is_empty()
+    {
+        let _ = tx.unbounded_send(Event::Changed { account: acc.id, folder: f.id });
+    }
+}
+
+/// 取出密码发信；连接卡住时 60 秒后放弃，写信框不会一直显示发送中
+async fn send(acc: &Account, mail: &Built) -> Result<()> {
+    let secret = cred::load(&acc.email)?;
+    tokio::time::timeout(Duration::from_secs(60), smtp::send(acc, &secret, mail)).await.map_err(|_| "timeout")?
 }
 
 /// 用手上的连接执行；失败就丢掉它，换新连接再试一次（空闲久了服务器会断开）

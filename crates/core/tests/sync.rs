@@ -1,12 +1,14 @@
-//! 对着本地 IMAP 测试服务器走一遍同步：首次拉取、写回已读和星标、另一端改标记 / 删信 / 来新信后再同步、下载正文、
-//! 移动和彻底删除、IDLE 实时收新信。
-//! 默认跳过。跑法（GreenMail，明文 IMAP 端口 3143，一次一跑，跑完重启服务器清空邮箱）：
-//!   java -Dgreenmail.setup.test.imap -Dgreenmail.users=t:p@localhost -jar greenmail-standalone.jar
-//!   MAILPRO_TEST_IMAP=127.0.0.1:3143 cargo test -p mailpro-core --test sync -- --ignored
+//! 对着本地测试服务器走一遍同步：首次拉取、写回已读和星标、另一端改标记 / 删信 / 来新信后再同步、下载正文、
+//! 移动和彻底删除、IDLE 实时收新信；另一个用户发信、存草稿。
+//! 默认跳过。跑法（GreenMail，明文 IMAP 端口 3143、SMTP 端口 3025，一次一跑，跑完重启服务器清空邮箱）：
+//!   java -Dgreenmail.setup.test.imap -Dgreenmail.setup.test.smtp -Dgreenmail.users=t:p@localhost,u:p@localhost -jar greenmail-standalone.jar
+//!   MAILPRO_TEST_IMAP=127.0.0.1:3143 MAILPRO_TEST_SMTP=127.0.0.1:3025 cargo test -p mailpro-core --test sync -- --ignored
 
 use futures::TryStreamExt;
 use futures::future::{Either, select};
 use mailpro_core::imap::{self, Changes, Event, Session};
+use mailpro_core::message;
+use mailpro_core::smtp::{self, Mail};
 use mailpro_core::store::{Account, FLAGGED, SEEN, Store};
 use std::time::Duration;
 use tokio::net::TcpStream;
@@ -44,7 +46,7 @@ fn syncs_against_server() {
         }
 
         let db = Store::open(":memory:").unwrap();
-        let acc = Account { id: 0, email: "t@localhost".into(), host: "127.0.0.1".into(), port: 3143, proxy: None };
+        let acc = Account { email: "t@localhost".into(), host: "127.0.0.1".into(), port: 3143, ..Default::default() };
         db.add_account(&acc).unwrap();
         let acc = db.accounts().unwrap().remove(0);
         imap::sync_all(&mut me, &db, &acc, &mut |_| {}).await.unwrap();
@@ -112,5 +114,42 @@ fn syncs_against_server() {
         if let Either::Left((r, _)) = select(watcher, web_side).await {
             panic!("watcher 提前结束：{:?}", r.err());
         }
+    });
+}
+
+#[test]
+#[ignore]
+fn sends_and_saves_drafts() {
+    let (imap_addr, smtp_addr) = (std::env::var("MAILPRO_TEST_IMAP").unwrap(), std::env::var("MAILPRO_TEST_SMTP").unwrap());
+    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    rt.block_on(async {
+        let acc = Account { email: "u@localhost".into(), name: "U".into(), host: "127.0.0.1".into(), port: 3143, ..Default::default() };
+        let m = Mail { to: "U <u@localhost>".into(), bcc: "hidden@localhost".into(), subject: "测试 发信".into(), body: "第一行\n第二行".into(), ..Default::default() };
+        let b = smtp::build(&acc, &m).unwrap();
+        smtp::deliver(TcpStream::connect(&smtp_addr).await.unwrap(), "u", "p", &b).await.unwrap();
+
+        // 收到的这封：EHLO 报 [127.0.0.1]，没有 Bcc 头
+        let mut s = imap::login(TcpStream::connect(&imap_addr).await.unwrap(), "u", "p").await.unwrap();
+        s.select("INBOX").await.unwrap();
+        let f: Vec<_> = s.fetch("1", "BODY.PEEK[]").await.unwrap().try_collect().await.unwrap();
+        let raw = f[0].body().unwrap();
+        let text = String::from_utf8_lossy(raw);
+        assert!(text.contains("[127.0.0.1]") && !text.contains("Bcc:"), "{text}");
+        let o = message::original(raw).unwrap();
+        assert_eq!((o.subject.as_str(), o.text.as_str()), ("测试 发信", "第一行\n第二行"));
+
+        // 草稿：存进文件夹，同步后看得到，带 Bcc 头、已读
+        s.create("Drafts").await.unwrap();
+        let db = Store::open(":memory:").unwrap();
+        db.add_account(&acc).unwrap();
+        let acc = db.accounts().unwrap().remove(0);
+        imap::sync_all(&mut s, &db, &acc, &mut |_| {}).await.unwrap();
+        let drafts = db.folders(acc.id).unwrap().into_iter().find(|f| f.name == "Drafts").unwrap();
+        imap::append(&mut s, &drafts, &b.copy, "(\\Draft \\Seen)").await.unwrap();
+        assert_eq!(imap::sync_folder(&mut s, &db, &drafts).await.unwrap(), Changes { new: 1, ..Default::default() });
+        let h = db.list(drafts.id, 1).unwrap().remove(0);
+        assert_eq!((h.subject.as_str(), h.flags & SEEN), ("测试 发信", SEEN));
+        let raw = imap::fetch_body(&mut s, &db, &drafts, h.uid).await.unwrap().unwrap();
+        assert_eq!(message::original(&raw).unwrap().bcc.iter().map(|m| m.email.to_string()).collect::<Vec<_>>(), ["hidden@localhost"]);
     });
 }

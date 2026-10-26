@@ -1,4 +1,5 @@
-//! IMAP 同步：把文件夹和邮件头拉进本地缓存，写回本地的标记改动，在收件箱上 IDLE 等新变化；移动、删除邮件。
+//! IMAP 同步：把文件夹和邮件头拉进本地缓存，写回本地的标记改动，在收件箱上 IDLE 等新变化；移动、删除邮件，
+//! 存草稿和已发送。
 
 use crate::store::{self, Account, Folder, Header, Store};
 use async_imap::imap_proto::{BodyStructure, NameAttribute};
@@ -149,7 +150,7 @@ pub async fn flush<T: Io>(s: &mut Session<T>, db: &Store, f: &Folder) -> Result<
 /// 把待写回的标记改动写回服务器，调用前文件夹要已选中
 async fn write_pending<T: Io>(s: &mut Session<T>, db: &Store, f: &Folder) -> Result<()> {
     let pending = db.pending(f.id)?;
-    for (flag, name) in [(store::SEEN, "\\Seen"), (store::FLAGGED, "\\Flagged")] {
+    for (flag, name) in [(store::SEEN, "\\Seen"), (store::FLAGGED, "\\Flagged"), (store::ANSWERED, "\\Answered")] {
         for on in [true, false] {
             let uids: Vec<u32> = pending.iter().filter(|p| p.1 & flag != 0 && (p.2 & flag != 0) == on).map(|p| p.0).collect();
             let op = format!("{}FLAGS.SILENT ({name})", if on { '+' } else { '-' });
@@ -183,6 +184,11 @@ pub async fn move_to<T: Io>(s: &mut Session<T>, f: &Folder, uids: &[u32], to: Op
         }
     }
     Ok(())
+}
+
+/// 把一封存进文件夹，`flags` 带括号，如 `(\Draft \Seen)`
+pub async fn append<T: Io>(s: &mut Session<T>, f: &Folder, raw: &[u8], flags: &str) -> Result<()> {
+    Ok(s.append(&f.name, Some(flags), None, raw).await?)
 }
 
 /// 一封邮件的原始内容：先查缓存，没有再下载。BODY.PEEK 不会顺带把邮件标成已读。

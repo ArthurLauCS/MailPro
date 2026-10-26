@@ -8,9 +8,12 @@ license = "MIT"
 ammonia = "4.2"
 async-imap = { version = "0.12", default-features = false, features = ["runtime-tokio"] }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
+fastrand = "2"
 futures = "0.3"
+lettre = { version = "0.11.23", default-features = false, features = ["builder", "smtp-transport", "tokio1"] }
 # full_encoding：GBK / gb2312 / Big5 等非 UTF-8 字符集，中文邮件常见
 mail-parser = { version = "1.0", features = ["full_encoding"] }
+percent-encoding = "2"
 regex = "1"
 rusqlite = { version = "0.41", features = ["bundled", "fallible_uint"] }
 tokio = { version = "1", features = ["rt", "net", "time", "io-util"] }

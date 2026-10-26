@@ -9,7 +9,7 @@ pub const SEEN: u8 = 1;
 pub const FLAGGED: u8 = 2;
 pub const ANSWERED: u8 = 4;
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct Account {
     pub id: i64,
     /// 同时是登录名
@@ -18,6 +18,11 @@ pub struct Account {
     pub port: u16,
     /// SOCKS5 代理 `主机:端口`；None 为直连
     pub proxy: Option<String>,
+    /// 发信时的显示名，空为只写地址
+    pub name: String,
+    /// 发信服务器，只走隐式 TLS（通常 465 端口）
+    pub smtp_host: String,
+    pub smtp_port: u16,
 }
 
 #[derive(Clone)]
@@ -83,6 +88,11 @@ const MIGRATIONS: &[&str] = &[
     "ALTER TABLE folder ADD COLUMN role TEXT",
     // 原有的行只记已读：seen 的 0 / 1 正好是 SEEN 位的值
     "ALTER TABLE pending RENAME COLUMN seen TO bits; ALTER TABLE pending ADD COLUMN mask INTEGER NOT NULL DEFAULT 1",
+    // 已有账号的发信服务器按 [`crate::smtp::default_host`] 的规则从收信服务器推出
+    "ALTER TABLE account ADD COLUMN name TEXT NOT NULL DEFAULT '';
+     ALTER TABLE account ADD COLUMN smtp_host TEXT NOT NULL DEFAULT '';
+     ALTER TABLE account ADD COLUMN smtp_port INTEGER NOT NULL DEFAULT 465;
+     UPDATE account SET smtp_host = CASE WHEN host LIKE 'imap.%' THEN 'smtp.' || substr(host, 6) ELSE host END",
 ];
 
 pub struct Store(Connection);
@@ -128,9 +138,9 @@ impl Store {
     /// 新增或按邮箱更新，返回账号 id
     pub fn add_account(&self, a: &Account) -> Result<i64> {
         self.0.query_row(
-            "INSERT INTO account (email, host, port, proxy) VALUES (?1, ?2, ?3, ?4)
-             ON CONFLICT (email) DO UPDATE SET host = ?2, port = ?3, proxy = ?4 RETURNING id",
-            params![a.email, a.host, a.port, a.proxy],
+            "INSERT INTO account (email, host, port, proxy, name, smtp_host, smtp_port) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT (email) DO UPDATE SET host = ?2, port = ?3, proxy = ?4, name = ?5, smtp_host = ?6, smtp_port = ?7 RETURNING id",
+            params![a.email, a.host, a.port, a.proxy, a.name, a.smtp_host, a.smtp_port],
             |r| r.get(0),
         )
     }
@@ -161,9 +171,18 @@ impl Store {
     }
 
     pub fn accounts(&self) -> Result<Vec<Account>> {
-        let mut st = self.0.prepare("SELECT id, email, host, port, proxy FROM account ORDER BY id")?;
+        let mut st = self.0.prepare("SELECT id, email, host, port, proxy, name, smtp_host, smtp_port FROM account ORDER BY id")?;
         st.query_map([], |r| {
-            Ok(Account { id: r.get(0)?, email: r.get(1)?, host: r.get(2)?, port: r.get(3)?, proxy: r.get(4)? })
+            Ok(Account {
+                id: r.get(0)?,
+                email: r.get(1)?,
+                host: r.get(2)?,
+                port: r.get(3)?,
+                proxy: r.get(4)?,
+                name: r.get(5)?,
+                smtp_host: r.get(6)?,
+                smtp_port: r.get(7)?,
+            })
         })?
         .collect()
     }
@@ -381,10 +400,12 @@ mod tests {
     fn pending_wins_over_server_flags() {
         let db = Store::open(":memory:").unwrap();
         let proxy = Some("127.0.0.1:7898".to_string());
-        db.add_account(&Account { id: 0, email: "a@x".into(), host: "imap.x".into(), port: 993, proxy }).unwrap();
+        let smtp_host = "smtp.x".to_string();
+        db.add_account(&Account { email: "a@x".into(), host: "imap.x".into(), port: 993, proxy, name: "A".into(), smtp_host, smtp_port: 465, id: 0 }).unwrap();
         let acc = db.accounts().unwrap()[0].id;
         db.set_proxy(acc, None).unwrap();
-        assert_eq!(db.accounts().unwrap()[0].proxy, None);
+        let a = &db.accounts().unwrap()[0];
+        assert_eq!((a.proxy.as_deref(), a.name.as_str(), a.smtp_host.as_str(), a.smtp_port), (None, "A", "smtp.x", 465));
         db.set_folders(acc, &[("INBOX".into(), Some("inbox"))]).unwrap();
         let f = db.folders(acc).unwrap()[0].id;
         assert_eq!(db.put_headers(f, &[header(1), header(2)]).unwrap(), 2);
@@ -423,7 +444,7 @@ mod tests {
     #[test]
     fn search_matches_every_word() {
         let db = Store::open(":memory:").unwrap();
-        db.add_account(&Account { id: 0, email: "a@x".into(), host: "imap.x".into(), port: 993, proxy: None }).unwrap();
+        db.add_account(&Account { email: "a@x".into(), ..Default::default() }).unwrap();
         let acc = db.accounts().unwrap()[0].id;
         db.set_folders(acc, &[("INBOX".into(), Some("inbox")), ("Work".into(), None)]).unwrap();
         let id = |name: &str| db.folders(acc).unwrap().into_iter().find(|f| f.name == name).unwrap().id;
