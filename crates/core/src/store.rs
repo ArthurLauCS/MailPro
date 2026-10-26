@@ -317,6 +317,12 @@ impl Store {
         st.query_map(params![folder, limit], header)?.collect()
     }
 
+    /// 文件夹里 uid 大于 `after`、`since` 起收到的未读邮件，新的在前（新信通知用）
+    pub fn fresh(&self, folder: i64, after: u32, since: i64) -> Result<Vec<Header>> {
+        let mut st = self.0.prepare(&format!("SELECT {HEADER} FROM message WHERE folder = ?1 AND uid > ?2 AND date >= ?3 AND flags & 1 = 0 ORDER BY date DESC"))?;
+        st.query_map(params![folder, after, since], header)?.collect()
+    }
+
     /// 这些文件夹里主题、发件人名字或地址含有每一个词的邮件，新的在前；不分大小写只限英文字母
     pub fn search(&self, folders: &[i64], words: &[&str]) -> Result<Vec<Header>> {
         let ids: Vec<String> = folders.iter().map(i64::to_string).collect();
@@ -435,6 +441,9 @@ mod tests {
 
         // 测试邮件的收到时间等于 uid
         assert_eq!(db.latest(f).unwrap(), 3);
+        // 新信通知：2 已读，3 未读
+        let uids = |after, since| db.fresh(f, after, since).unwrap().iter().map(|h| h.uid).collect::<Vec<_>>();
+        assert_eq!((uids(0, 0), uids(3, 0), uids(0, 4)), (vec![3], vec![], vec![]));
         db.reset_folder(f, 7).unwrap();
         assert_eq!((db.max_uid(f).unwrap(), db.latest(f).unwrap()), (0, 0));
         db.set_folders(acc, &[]).unwrap();

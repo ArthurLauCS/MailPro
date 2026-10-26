@@ -5,7 +5,7 @@ mod compose;
 
 use crate::i18n::{EN, Lang, ROLES, T, ZH, t};
 use crate::theme::{self, DISPLAY, PROSE, R_MD};
-use crate::{browser, webview};
+use crate::{browser, tray, webview};
 use compose::{Compose, Respond};
 use chrono::{DateTime, Datelike, Local};
 use futures::StreamExt;
@@ -35,7 +35,7 @@ use mailpro_core::smtp::{self, Mail};
 use mailpro_core::store::{self, Account, Folder, Header, Store};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use std::cell::Cell;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::rc::Rc;
 use std::time::Duration;
@@ -204,6 +204,13 @@ pub struct MailPro {
     collapsed: HashSet<i64>,
     /// 等到最早一个账号该熄灭泛光时重画
     glow: Task<()>,
+    tray: tray::Tray,
+    /// 收件箱 id →（这时刻起收到的才弹新信通知，已经看过的最大 uid），见 [`MailPro::notify_new`]
+    fresh: HashMap<i64, (i64, u32)>,
+    /// 最近一条通知点开后去哪：（账号，收件箱，只有一封时它的 uid）
+    notice: Option<(i64, i64, Option<u32>)>,
+    /// 点通知要打开的那封（文件夹 id，uid），列表读好后打开
+    goto: Option<(i64, u32)>,
 }
 
 impl MailPro {
@@ -229,6 +236,21 @@ impl MailPro {
             }
         })
         .detach();
+        let (tx, mut rx) = futures::channel::mpsc::unbounded();
+        let tray = tray::Tray::new(&path, t(cx), tx);
+        cx.spawn_in(window, async move |this, cx| {
+            while let Some(e) = rx.next().await {
+                if this.update_in(cx, |v, window, cx| v.on_tray(e, window, cx)).is_err() {
+                    break;
+                }
+            }
+        })
+        .detach();
+        // 关窗口只是藏起来，继续收信；从托盘菜单退出
+        window.on_window_should_close(cx, |window, _| {
+            tray::hide(hwnd(window));
+            false
+        });
 
         let current = webview::Current::default();
         let reading = eml.map(|m| {
@@ -275,6 +297,10 @@ impl MailPro {
             browser,
             collapsed,
             glow: Task::ready(()),
+            tray,
+            fresh: HashMap::new(),
+            notice: None,
+            goto: None,
         };
         v.viewer(window, cx);
         v.reload_accounts();
@@ -289,14 +315,13 @@ impl MailPro {
             let _ = unsafe { c.Close() };
         }
         self.placed.set(None);
-        let RawWindowHandle::Win32(h) = window.window_handle().expect("window handle").as_raw() else { unreachable!() };
         let bg = cx.theme().is_dark().then(|| {
             let c = cx.theme().background.to_rgb();
             let u = |v: f32| (v * 255.).round() as u8;
             COREWEBVIEW2_COLOR { A: 255, R: u(c.r), G: u(c.g), B: u(c.b) }
         });
         let (tx, mut rx) = futures::channel::mpsc::unbounded();
-        webview::create(HWND(h.hwnd.get() as _), self.current.clone(), tx, bg).expect("WebView2");
+        webview::create(hwnd(window), self.current.clone(), tx, bg).expect("WebView2");
         self.web_events = cx.spawn_in(window, async move |this, cx| {
             while let Some(e) = rx.next().await {
                 if this.update_in(cx, |v, window, cx| v.on_webview(e, window, cx)).is_err() {
@@ -325,7 +350,14 @@ impl MailPro {
         let Some(a) = self.accounts.iter_mut().find(|a| a.acc.id == account) else { return };
         let folders = db.folders(account).unwrap_or_default();
         a.folders = folders.into_iter().map(|f| (db.stats(f.id).map_or(0, |s| s.1), f)).map(|(n, f)| (f, n)).collect();
-        a.latest = a.folders.iter().find(|f| f.0.role.as_deref() == Some("inbox")).map_or(0, |f| db.latest(f.0.id).unwrap_or(0));
+        let inbox = a.folders.iter().find(|f| f.0.role.as_deref() == Some("inbox")).map(|f| f.0.id);
+        a.latest = inbox.map_or(0, |id| db.latest(id).unwrap_or(0));
+        // 收件箱从第一次读到它起（启动时，或新加的账号列出文件夹时）收到的新信才弹通知
+        if let Some(id) = inbox {
+            self.fresh.entry(id).or_insert_with(|| (Local::now().timestamp(), db.max_uid(id).unwrap_or(0)));
+        }
+        let inboxes = self.accounts.iter().flat_map(|a| &a.folders).filter(|f| f.0.role.as_deref() == Some("inbox"));
+        self.tray.unread(inboxes.map(|f| f.1).sum());
     }
 
     /// 把账号 `from` 挪到 `to` 的位置：往下拖落在它后面，往上拖落在它前面
@@ -398,6 +430,9 @@ impl MailPro {
                     if !v.picked.is_empty() {
                         let shown: HashSet<u32> = v.headers.iter().filter(|h| h.folder == v.picked_in.1).map(|h| h.uid).collect();
                         v.picked.retain(|u| shown.contains(u));
+                    }
+                    if let Some((f, uid)) = v.goto.take_if(|g| g.0 == folder) {
+                        v.click(f, uid, Modifiers::default(), cx);
                     }
                     cx.notify();
                 }
@@ -618,6 +653,7 @@ impl MailPro {
             }
             Event::Changed { account, folder } => {
                 self.reload_folders(account);
+                self.notify_new(account, folder, window, t);
                 if self.mixed || self.sel == Some((account, folder)) {
                     self.load(cx);
                 }
@@ -670,6 +706,47 @@ impl MailPro {
         // 新邮件到了可能要亮起泛光，改排熄灭的时刻
         self.glow(cx);
         cx.notify();
+    }
+
+    /// 收件箱新到的未读信弹通知（只算 `fresh` 记的时刻起收到的），窗口在前台时不弹。
+    /// 一封显示发件人和主题，点开即打开它；多封合成一条，点开打开收件箱
+    fn notify_new(&mut self, account: i64, folder: i64, window: &Window, t: &T) {
+        let Some((since, after)) = self.fresh.get_mut(&folder) else { return };
+        let new = self.db.fresh(folder, *after, *since).unwrap_or_default();
+        let Some(top) = new.iter().map(|h| h.uid).max() else { return };
+        *after = top;
+        if window.is_window_active() {
+            return;
+        }
+        let Some(a) = self.accounts.iter().find(|a| a.acc.id == account) else { return };
+        match &new[..] {
+            [h] => {
+                let from = if h.from_name.is_empty() { &h.from_addr } else { &h.from_name };
+                self.tray.notify(from, if h.subject.is_empty() { t.no_subject } else { &h.subject });
+            }
+            _ => self.tray.notify(&a.acc.email, &t.new_mail.replace("{n}", &new.len().to_string())),
+        }
+        self.notice = Some((account, folder, (new.len() == 1).then_some(top)));
+    }
+
+    fn on_tray(&mut self, e: tray::Event, window: &mut Window, cx: &mut Context<Self>) {
+        match e {
+            tray::Event::Open => {}
+            tray::Event::Clicked => {
+                if let Some((account, folder, uid)) = self.notice {
+                    self.query.update(cx, |q, cx| q.clean(window, cx));
+                    self.goto = uid.map(|uid| (folder, uid));
+                    self.select(account, folder, cx);
+                }
+            }
+            tray::Event::Exit => {
+                self.tray.remove();
+                return cx.quit();
+            }
+            tray::Event::Readd => return self.tray.add(),
+        }
+        tray::show(hwnd(window));
+        window.activate_window();
     }
 
     fn on_webview(&mut self, e: webview::Event, window: &mut Window, cx: &mut Context<Self>) {
@@ -776,6 +853,7 @@ impl MailPro {
 
     fn set_language(&mut self, t: &'static T, window: &mut Window, cx: &mut Context<Self>) {
         cx.set_global(Lang(t));
+        self.tray.lang(t);
         self.query.update(cx, |q, cx| q.set_placeholder(t.search, window, cx));
         let _ = self.db.set_setting("language", t.code);
         cx.refresh_windows();
@@ -1535,6 +1613,11 @@ fn move_dialog(folders: &[Folder], view: &WeakEntity<MailPro>, dialog: Dialog, c
 }
 
 /// 对话框标题：衬线粗体
+fn hwnd(window: &Window) -> HWND {
+    let RawWindowHandle::Win32(h) = HasWindowHandle::window_handle(window).expect("window handle").as_raw() else { unreachable!() };
+    HWND(h.hwnd.get() as _)
+}
+
 fn title(s: &str) -> impl IntoElement {
     div().font_family(DISPLAY).text_xl().font_weight(FontWeight::BOLD).child(s.to_string())
 }

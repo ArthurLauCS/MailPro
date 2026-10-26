@@ -116,6 +116,10 @@ pub struct T {
     /// 转发时原信头部的分隔行，及各栏名后的冒号
     pub forwarded: &'static str,
     pub colon: &'static str,
+    /// 托盘菜单的退出；悬停提示和多封新信的通知，`{n}` 换成封数
+    pub exit: &'static str,
+    pub unread_tip: &'static str,
+    pub new_mail: &'static str,
     /// 今年以内的日期格式（chrono）
     pub day: &'static str,
     pub full_day: &'static str,
@@ -228,6 +232,9 @@ pub static ZH: T = T {
     wrote: "{date}，{from} 写道：",
     forwarded: "---------- 转发的邮件 ----------",
     colon: "：",
+    exit: "退出",
+    unread_tip: "MailPro：{n} 封未读",
+    new_mail: "{n} 封新邮件",
     day: "%-m月%-d日",
     full_day: "%Y/%-m/%-d",
     roles: ["收件箱", "已加星标", "重要", "已发送", "草稿", "所有邮件", "归档", "垃圾邮件", "已删除"],
@@ -336,6 +343,9 @@ pub static EN: T = T {
     wrote: "On {date}, {from} wrote:",
     forwarded: "---------- Forwarded message ----------",
     colon: ": ",
+    exit: "Exit",
+    unread_tip: "MailPro: {n} unread",
+    new_mail: "{n} new messages",
     day: "%b %-d",
     full_day: "%b %-d, %Y",
     roles: ["Inbox", "Starred", "Important", "Sent", "Drafts", "All Mail", "Archive", "Spam", "Trash"],

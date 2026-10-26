@@ -41,10 +41,11 @@ Mail and settings are stored in `%LOCALAPPDATA%\MailPro`; passwords and Outlook 
 5. Click a message to open it; Ctrl-click adds or removes one, Shift-click selects a range. Archive, delete, move, mark read / unread and star from the buttons at the top of the reader or from the right-click menu; the button at the top of the list marks the whole folder read. Delete moves to Trash, and inside Trash deletes forever after a confirmation. Changes are written to the server; moving and deleting need the account to be connected.
 6. The search box at the top of the list finds messages whose subject or sender contains every word you type. The button next to it switches between **This folder** and **All mailboxes** (every folder of every account; results show their folder). Message bodies are not searched. Clicking a folder clears the search.
 7. The pen button at the top of the list writes a new message; the reader header has **Reply**, **Reply all** and **Forward**, and `mailto:` links open a new message. Closing the window saves a changed message to Drafts; click a draft to continue it. Sent mail is copied to Sent (Gmail does this itself). The sender name is set in the account settings and may be left empty.
+8. Closing the window keeps MailPro running in the notification area, still receiving mail: click its icon to bring the window back, or right-click it and choose **Exit**. Starting MailPro again also brings back the open window. New unread mail in an inbox shows a desktop notification while the window isn't in front: one message shows its sender and subject and opens when clicked; several arriving together show a count for the account and open its inbox. Turn notifications off in Windows Settings → System → Notifications.
 
 ## Current limits
 
-Not yet available: attachments and formatted text when writing, desktop notifications, and import / export of settings. Outlook / Hotmail supports personal Microsoft accounts only, not work or school accounts.
+Not yet available: attachments and formatted text when writing, and import / export of settings. Outlook / Hotmail supports personal Microsoft accounts only, not work or school accounts.
 
 ## Development
 

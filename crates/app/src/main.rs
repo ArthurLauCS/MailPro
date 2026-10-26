@@ -3,6 +3,7 @@
 mod browser;
 mod i18n;
 mod theme;
+mod tray;
 mod view;
 mod webview;
 
@@ -35,6 +36,10 @@ fn main() {
     // 带 .eml 参数时直接显示这封，隐私测试用（scripts/drive.ps1）
     let eml = std::env::args().nth(1).map(|p| message::parse(&std::fs::read(&p).expect("读取邮件")).expect("解析邮件"));
     let path = store::path().expect("数据目录");
+    // 同一份数据已经开着：唤出原来的窗口，不开第二个
+    if tray::wake(&path) {
+        return;
+    }
     let db = Store::open(&path).expect("数据库");
     // 默认的 Assets 只带组件自用的百来个图标，文件夹、附件等图标要全套 Lucide
     gpui_platform::application().with_assets(gpui_kit_assets::AllAssets).run(move |cx: &mut App| {
