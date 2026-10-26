@@ -2,6 +2,7 @@
 //! 同步在后台引擎（[`engine`]）里跑，这里读数据库、发命令、按引擎的事件刷新。
 
 use crate::i18n::{EN, Lang, ROLES, T, ZH, t};
+use crate::theme::{self, DISPLAY, PROSE, R_MD};
 use crate::{browser, webview};
 use chrono::{DateTime, Datelike, Local};
 use futures::StreamExt;
@@ -9,8 +10,8 @@ use futures::channel::mpsc::UnboundedSender;
 use futures::channel::oneshot;
 use gpui::prelude::*;
 use gpui::{
-    AnyElement, App, Bounds, ClipboardItem, Context, Entity, FontWeight, PathPromptOptions, Pixels, ScrollStrategy, Task, UniformListScrollHandle,
-    WeakEntity, Window, canvas, div, hsla, px, uniform_list, white,
+    AnyElement, App, Bounds, BoxShadow, ClipboardItem, Context, Entity, FontWeight, PathPromptOptions, Pixels, ScrollStrategy, SharedString, Task,
+    UniformListScrollHandle, WeakEntity, Window, canvas, div, hsla, point, px, relative, uniform_list, white,
 };
 use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::dialog::Dialog;
@@ -18,7 +19,7 @@ use gpui_component::input::{Input, InputState};
 use gpui_component::menu::{DropdownMenu, PopupMenuItem};
 use gpui_component::resizable::{h_resizable, resizable_panel};
 use gpui_component::scroll::ScrollableElement;
-use gpui_component::{ActiveTheme, Disableable, Icon, Sizable, Theme, WindowExt, h_flex, v_flex};
+use gpui_component::{ActiveTheme, Disableable, Icon, Sizable, WindowExt, h_flex, v_flex};
 use gpui_kit_assets::IconName;
 use mailpro_core::cred;
 use mailpro_core::engine::{self, BodyError, Cmd, Event};
@@ -31,18 +32,37 @@ use std::cell::Cell;
 use std::collections::HashSet;
 use std::ops::Range;
 use std::rc::Rc;
-use webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2Controller;
+use std::time::Duration;
+use webview2_com::Microsoft::Web::WebView2::Win32::{COREWEBVIEW2_COLOR, ICoreWebView2Controller};
 use windows::Win32::Foundation::{HWND, RECT};
 
 /// 邮件列表一行的高度；虚拟列表要求每行等高
 const ROW: f32 = 56.;
+/// 收件箱这么多秒内收到过邮件的账号行泛光
+const GLOW: i64 = 30 * 60;
 
 struct Acct {
     acc: Account,
     /// 文件夹及未读数，按 [`Store::folders`] 的顺序
     folders: Vec<(Folder, u32)>,
+    /// 收件箱最新一封的收到时间，没有为 0
+    latest: i64,
     /// 连接断开的原因，重新连上后清掉
     error: Option<String>,
+}
+
+/// 拖动中的账号，跟着鼠标画一个强调色的小条
+#[derive(Clone)]
+struct DraggedAccount {
+    id: i64,
+    email: SharedString,
+}
+
+impl Render for DraggedAccount {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
+        div().px_3().py_1().rounded(R_MD).bg(theme.primary).text_color(theme.primary_foreground).text_sm().font_weight(FontWeight::SEMIBOLD).child(self.email.clone())
+    }
 }
 
 enum Body {
@@ -131,6 +151,8 @@ pub struct MailPro {
     reading: Option<Reading>,
     current: webview::Current,
     web: Option<ICoreWebView2Controller>,
+    /// 收当前查看器事件的任务；换掉就不再收旧查看器的
+    web_events: Task<()>,
     /// 上次给 WebView2 的位置（物理像素）和可见性，没变就不再设
     placed: Rc<Cell<Option<(RECT, bool)>>>,
     /// 每次显示新邮件加一，让 WebView2 重新加载
@@ -140,13 +162,23 @@ pub struct MailPro {
     browser: String,
     /// 左栏收起的账号 id，存在设置 `collapsed` 里（空格分隔），重启后保持
     collapsed: HashSet<i64>,
+    /// 等到最早一个账号该熄灭泛光时重画
+    glow: Task<()>,
 }
 
 impl MailPro {
     /// `eml`：命令行带了 .eml 时直接显示这封，隐私测试用
     pub fn new(db: Store, path: String, eml: Option<Message>, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        Theme::sync_system_appearance(Some(window), cx);
-        cx.observe_window_appearance(window, |_, window, cx| Theme::sync_system_appearance(Some(window), cx)).detach();
+        theme::apply(theme::system_dark(window), window, cx);
+        // 深浅色跟随系统；正文的深色只能在建查看器时给，换了就重建
+        cx.observe_window_appearance(window, |v, window, cx| {
+            let dark = theme::system_dark(window);
+            if dark != cx.theme().is_dark() {
+                theme::apply(dark, window, cx);
+                v.viewer(window, cx);
+            }
+        })
+        .detach();
 
         let (cmd, mut events) = engine::spawn(path.clone());
         cx.spawn_in(window, async move |this, cx| {
@@ -159,18 +191,6 @@ impl MailPro {
         .detach();
 
         let current = webview::Current::default();
-        let RawWindowHandle::Win32(h) = window.window_handle().expect("window handle").as_raw() else { unreachable!() };
-        let (tx, mut rx) = futures::channel::mpsc::unbounded();
-        webview::create(HWND(h.hwnd.get() as _), current.clone(), tx).expect("WebView2");
-        cx.spawn_in(window, async move |this, cx| {
-            while let Some(e) = rx.next().await {
-                if this.update_in(cx, |v, window, cx| v.on_webview(e, window, cx)).is_err() {
-                    break;
-                }
-            }
-        })
-        .detach();
-
         let reading = eml.map(|m| {
             let mut r = Reading::new(0, 0, 0, 0, String::new(), String::new(), String::new(), false);
             r.shown(&m);
@@ -191,23 +211,54 @@ impl MailPro {
             reading,
             current,
             web: None,
+            web_events: Task::ready(()),
             placed: Rc::default(),
             seq: 0,
             form: None,
             browser,
             collapsed,
+            glow: Task::ready(()),
         };
+        v.viewer(window, cx);
         v.reload_accounts();
         v.select_first(None, cx);
+        v.glow(cx);
         v
+    }
+
+    /// 建正文查看器，深浅色跟当前主题；已有的先关掉
+    fn viewer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(c) = self.web.take() {
+            let _ = unsafe { c.Close() };
+        }
+        self.placed.set(None);
+        let RawWindowHandle::Win32(h) = window.window_handle().expect("window handle").as_raw() else { unreachable!() };
+        let bg = cx.theme().is_dark().then(|| {
+            let c = cx.theme().background.to_rgb();
+            let u = |v: f32| (v * 255.).round() as u8;
+            COREWEBVIEW2_COLOR { A: 255, R: u(c.r), G: u(c.g), B: u(c.b) }
+        });
+        let (tx, mut rx) = futures::channel::mpsc::unbounded();
+        webview::create(HWND(h.hwnd.get() as _), self.current.clone(), tx, bg).expect("WebView2");
+        self.web_events = cx.spawn_in(window, async move |this, cx| {
+            while let Some(e) = rx.next().await {
+                if this.update_in(cx, |v, window, cx| v.on_webview(e, window, cx)).is_err() {
+                    break;
+                }
+            }
+        });
     }
 
     fn reload_accounts(&mut self) {
         let old = std::mem::take(&mut self.accounts);
-        for acc in self.db.accounts().unwrap_or_default() {
+        // 拖动排过的顺序存在设置 `order` 里（空格分隔的 id），没排过的按添加顺序接在后面
+        let order: Vec<i64> = self.db.setting("order").ok().flatten().unwrap_or_default().split_whitespace().filter_map(|s| s.parse().ok()).collect();
+        let mut accounts = self.db.accounts().unwrap_or_default();
+        accounts.sort_by_key(|a| order.iter().position(|&id| id == a.id).unwrap_or(usize::MAX));
+        for acc in accounts {
             let error = old.iter().find(|a| a.acc.id == acc.id).and_then(|a| a.error.clone());
             let id = acc.id;
-            self.accounts.push(Acct { acc, folders: Vec::new(), error });
+            self.accounts.push(Acct { acc, folders: Vec::new(), latest: 0, error });
             self.reload_folders(id);
         }
     }
@@ -217,6 +268,34 @@ impl MailPro {
         let Some(a) = self.accounts.iter_mut().find(|a| a.acc.id == account) else { return };
         let folders = db.folders(account).unwrap_or_default();
         a.folders = folders.into_iter().map(|f| (db.stats(f.id).map_or(0, |s| s.1), f)).map(|(n, f)| (f, n)).collect();
+        a.latest = a.folders.iter().find(|f| f.0.role.as_deref() == Some("inbox")).map_or(0, |f| db.latest(f.0.id).unwrap_or(0));
+    }
+
+    /// 把账号 `from` 挪到 `to` 的位置：往下拖落在它后面，往上拖落在它前面
+    fn move_account(&mut self, from: i64, to: i64, cx: &mut Context<Self>) {
+        let pos = |id| self.accounts.iter().position(|a| a.acc.id == id);
+        let (Some(i), Some(j)) = (pos(from), pos(to)) else { return };
+        let a = self.accounts.remove(i);
+        self.accounts.insert(j, a);
+        let ids: Vec<_> = self.accounts.iter().map(|a| a.acc.id.to_string()).collect();
+        let _ = self.db.set_setting("order", &ids.join(" "));
+        cx.notify();
+    }
+
+    /// 泛光到期不会有引擎事件来触发重画：等到最早一个账号该熄灭的时刻重画一次，再排下一个
+    fn glow(&mut self, cx: &mut Context<Self>) {
+        let now = Local::now().timestamp();
+        let next = self.accounts.iter().map(|a| a.latest + GLOW - now).filter(|&s| s > 0).min();
+        self.glow = match next {
+            Some(s) => cx.spawn(async move |this, cx| {
+                cx.background_executor().timer(Duration::from_secs(s as u64)).await;
+                let _ = this.update(cx, |v, cx| {
+                    v.glow(cx);
+                    cx.notify();
+                });
+            }),
+            None => Task::ready(()),
+        };
     }
 
     /// 还没选文件夹时选第一个（收件箱排在最前）；`account` 给定时只在该账号里选
@@ -329,6 +408,8 @@ impl MailPro {
                 }
             }
         }
+        // 新邮件到了可能要亮起泛光，改排熄灭的时刻
+        self.glow(cx);
         cx.notify();
     }
 
@@ -486,6 +567,7 @@ impl MailPro {
     fn sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let (t, theme) = (t(cx), cx.theme());
         let view = cx.entity().downgrade();
+        let now = Local::now().timestamp();
         let accounts = self.accounts.iter().map(|a| {
             let id = a.acc.id;
             let acc = a.acc.clone();
@@ -493,6 +575,10 @@ impl MailPro {
             // 收起时正在看的文件夹藏在里面，由账号行代它高亮
             let lit = collapsed && self.sel.is_some_and(|s| s.0 == id);
             let inbox = a.folders.iter().find(|f| f.0.role.as_deref() == Some("inbox")).map_or(0, |f| f.1);
+            // 收件箱最近收到过邮件：账号行淡淡地透出强调色，四周一圈柔光
+            let glow = now - a.latest < GLOW;
+            let halo = BoxShadow { color: theme.primary.opacity(0.22), offset: point(px(0.), px(0.)), blur_radius: px(6.), spread_radius: px(0.), inset: false };
+            let dragged = DraggedAccount { id, email: a.acc.email.clone().into() };
             let head = h_flex()
                 .gap_1()
                 .child(
@@ -503,10 +589,13 @@ impl MailPro {
                         .gap_1p5()
                         .px_2()
                         .py_1()
-                        .rounded_md()
+                        .rounded(R_MD)
                         .cursor_pointer()
+                        .when(glow, |d| d.bg(theme.primary.opacity(0.08)).shadow(vec![halo]))
                         .when(lit, |d| d.bg(theme.list_active))
                         .when(!lit, |d| d.hover(|d| d.bg(theme.list_hover)))
+                        // 拖到别的账号上松开就排到它的位置
+                        .on_drag(dragged, |d, _, _, cx| cx.new(|_| d.clone()))
                         .child(Icon::new(if collapsed { IconName::ChevronRight } else { IconName::ChevronDown }).xsmall().text_color(theme.muted_foreground))
                         .child(avatar(id, &a.acc.email))
                         .child(div().flex_1().truncate().text_sm().font_weight(FontWeight::SEMIBOLD).child(a.acc.email.clone()))
@@ -534,20 +623,27 @@ impl MailPro {
                     .pl(px(30.))
                     .pr_2()
                     .py_1()
-                    .rounded_md()
+                    .rounded(R_MD)
                     .text_sm()
                     .cursor_pointer()
-                    .when(selected, |d| d.bg(theme.list_active))
+                    .when(selected, |d| d.bg(theme.list_active).text_color(theme.link).font_weight(FontWeight::SEMIBOLD))
                     .when(!selected, |d| d.hover(|d| d.bg(theme.list_hover)))
-                    .child(Icon::new(folder_icon(f)).small().text_color(theme.muted_foreground))
+                    .child(Icon::new(folder_icon(f)).small().text_color(if selected { theme.link } else { theme.muted_foreground }))
                     .child(div().flex_1().truncate().child(folder_label(t, f)))
                     .when(*unread > 0, |d| d.child(div().text_xs().text_color(theme.muted_foreground).child(unread.to_string())))
                     .on_click(cx.listener(move |v, _, _, cx| v.select(id, fid, cx)))
             });
-            v_flex().gap_0p5().child(head).when(!collapsed, |d| {
-                d.when_some(a.error.clone(), |d, e| d.child(div().pl(px(30.)).pr_2().text_xs().text_color(theme.danger).child(format!("{}{e}", t.disconnected))))
-                    .children(folders)
-            })
+            let target = theme.list_active;
+            v_flex()
+                .gap_0p5()
+                .rounded(R_MD)
+                .drag_over::<DraggedAccount>(move |s, _, _, _| s.bg(target))
+                .on_drop(cx.listener(move |v, d: &DraggedAccount, _, cx| v.move_account(d.id, id, cx)))
+                .child(head)
+                .when(!collapsed, |d| {
+                    d.when_some(a.error.clone(), |d, e| d.child(div().pl(px(30.)).pr_2().text_xs().text_color(theme.danger).child(format!("{}{e}", t.disconnected))))
+                        .children(folders)
+                })
         });
         v_flex()
             .size_full()
@@ -560,7 +656,7 @@ impl MailPro {
                     .overflow_y_scroll()
                     .p_2()
                     .gap_2()
-                    .when(self.accounts.is_empty(), |d| d.child(div().p_2().text_sm().text_color(theme.muted_foreground).child(t.no_accounts)))
+                    .when(self.accounts.is_empty(), |d| d.child(div().p_2().font_family(PROSE).text_color(theme.muted_foreground).child(t.no_accounts)))
                     .children(accounts),
             )
             .child(
@@ -676,7 +772,7 @@ impl MailPro {
                     .gap_2()
                     .border_b_1()
                     .border_color(theme.border)
-                    .child(div().flex_none().text_sm().font_weight(FontWeight::SEMIBOLD).child(folder_label(t, &self.folder(a, f)?)))
+                    .child(div().flex_none().font_family(DISPLAY).font_weight(FontWeight::BOLD).child(folder_label(t, &self.folder(a, f)?)))
                     .child(muted(email).flex_1().truncate())
                     .child(muted(format!("{}{}", self.headers.len(), t.messages)).flex_none()),
             )
@@ -686,7 +782,7 @@ impl MailPro {
                 .flex_1()
                 .min_h_0()
                 .relative()
-                .when(empty, |d| d.flex().items_center().justify_center().text_sm().text_color(theme.muted_foreground).child(t.no_messages))
+                .when(empty, |d| d.flex().items_center().justify_center().font_family(PROSE).text_color(theme.muted_foreground).child(t.no_messages))
                 .when(!empty, |d| d.child(rows).vertical_scrollbar(&self.scroll)),
         )
     }
@@ -722,11 +818,11 @@ impl MailPro {
                 .bg(theme.background)
                 .border_b_1()
                 .border_color(theme.border)
-                .child(div().text_lg().font_weight(FontWeight::BOLD).child(subject))
+                .child(div().font_family(DISPLAY).text_xl().font_weight(FontWeight::BOLD).line_height(relative(1.3)).child(subject))
                 .child(
                     h_flex()
                         .gap_2()
-                        .child(div().flex_1().truncate().text_sm().child(r.from.clone()))
+                        .child(div().flex_1().truncate().text_sm().font_weight(FontWeight::SEMIBOLD).child(r.from.clone()))
                         .when(r.date > 0, |d| d.child(muted(date.format("%Y-%m-%d %H:%M").to_string()).flex_none())),
                 )
                 .children(remote)
@@ -736,7 +832,7 @@ impl MailPro {
             div()
                 .flex_1()
                 .relative()
-                .when(!show, |d| d.bg(theme.background).flex().items_center().justify_center().text_sm().text_color(theme.muted_foreground).child(status))
+                .when(!show, |d| d.bg(theme.background).flex().items_center().justify_center().font_family(PROSE).text_color(theme.muted_foreground).child(status))
                 .child(canvas(place, |_, _, _, _| {}).absolute().size_full()),
         )
     }
@@ -765,7 +861,7 @@ impl MailPro {
             .gap_2()
             .px_2()
             .py_1p5()
-            .rounded_md()
+            .rounded(R_MD)
             .bg(bg)
             .text_xs()
             .text_color(fg)
@@ -816,12 +912,12 @@ fn adspower_dialog(dlg: &Entity<AdsDlg>, view: &WeakEntity<MailPro>, dialog: Dia
     let field = |label: &'static str, input: &Entity<InputState>| v_flex().gap_1().child(div().text_sm().child(label)).child(Input::new(input));
     let (dlg, view) = (dlg.clone(), view.clone());
     dialog
-        .title(t.adspower.trim_end_matches('…'))
+        .title(title(t.adspower.trim_end_matches('…')))
         .w(px(440.))
         .child(
             v_flex()
                 .gap_3()
-                .child(div().text_xs().text_color(theme.muted_foreground).child(t.adspower_hint))
+                .child(div().font_family(PROSE).text_sm().line_height(relative(1.7)).text_color(theme.muted_foreground).child(t.adspower_hint))
                 .child(field(t.profile_id, &d.id))
                 .child(field("API key", &d.key))
                 .when_some(d.error.clone(), |d, e| d.child(div().text_xs().text_color(theme.danger).child(e))),
@@ -889,7 +985,7 @@ fn link_dialog(dlg: &Entity<LinkDlg>, view: &WeakEntity<MailPro>, dialog: Dialog
     };
     let copy = text.clone();
     dialog
-        .title(t.open_link)
+        .title(title(t.open_link))
         .w(px(560.))
         .child(
             v_flex()
@@ -936,7 +1032,7 @@ fn form_dialog(form: &Entity<Form>, view: &WeakEntity<MailPro>, dialog: Dialog, 
     let field = |label: &'static str, input: &Entity<InputState>| v_flex().gap_1().child(div().text_sm().child(label)).child(Input::new(input));
     let view = view.clone();
     dialog
-        .title(if settings { t.account_settings } else { t.add_account })
+        .title(title(if settings { t.account_settings } else { t.add_account }))
         .w(px(440.))
         .child(
             v_flex()
@@ -944,7 +1040,7 @@ fn form_dialog(form: &Entity<Form>, view: &WeakEntity<MailPro>, dialog: Dialog, 
                 .when(!settings, |d| d.child(field(t.email, &f.email)).child(field(password, &f.secret)))
                 .when(need_host, |d| d.child(h_flex().gap_2().child(field(t.server, &f.host).flex_1()).child(field(t.port, &f.port).w(px(90.)))))
                 .child(field(t.proxy, &f.proxy))
-                .when(direct, |d| d.child(div().text_xs().text_color(theme.warning).child(t.direct_warning)))
+                .when(direct, |d| d.child(div().font_family(PROSE).text_sm().text_color(theme.warning).child(t.direct_warning)))
                 .when_some(f.error.clone(), |d, e| d.child(div().text_xs().text_color(theme.danger).child(e))),
         )
         .footer(
@@ -962,6 +1058,11 @@ fn form_dialog(form: &Entity<Form>, view: &WeakEntity<MailPro>, dialog: Dialog, 
                         }),
                 ),
         )
+}
+
+/// 对话框标题：衬线粗体
+fn title(s: &str) -> impl IntoElement {
+    div().font_family(DISPLAY).text_xl().font_weight(FontWeight::BOLD).child(s.to_string())
 }
 
 /// 账号的首字母圆标；色相按账号 id 取黄金分割步进，相邻账号颜色差得开

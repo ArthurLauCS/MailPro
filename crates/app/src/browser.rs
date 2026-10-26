@@ -6,7 +6,7 @@
 
 use mailpro_core::cred;
 use serde_json::Value;
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
 use std::time::Duration;
 use windows::Win32::UI::Shell::ShellExecuteW;
@@ -58,11 +58,11 @@ pub fn open_adspower(url: &str, id: &str) -> Result<(), String> {
             env = api("start")?;
         }
         let port = env["debug_port"].as_str().and_then(|p| p.parse().ok()).ok_or("AdsPower: debug_port ?")?;
-        // 调试端口的 /json/new 把整个查询串解码一次当网址
-        let tab = get(port, "PUT", &format!("/json/new?{}", escape(url)), None);
-        // 刚关掉的环境在 AdsPower 收尾的几秒里仍报 Active，给的调试端口已经关了：等它报 Inactive 再拉起
-        if tab.is_ok() || tries == 10 {
-            return tab.map(drop);
+        // 刚关掉的环境在 AdsPower 收尾的几秒里仍报 Active，给的调试端口已经关了：等它报 Inactive 再拉起。
+        // 只在端口连不上时重来：开标签页的请求发出去后失败也不重发，免得重复打开
+        if TcpStream::connect(("127.0.0.1", port)).is_ok() || tries == 10 {
+            // 调试端口的 /json/new 把整个查询串解码一次当网址
+            return get(port, "PUT", &format!("/json/new?{}", escape(url)), None).map(drop);
         }
         tries += 1;
         pause();
@@ -75,21 +75,50 @@ fn escape(s: &str) -> String {
     s.bytes().map(|b| if b.is_ascii_alphanumeric() { (b as char).to_string() } else { format!("%{b:02X}") }).collect()
 }
 
-/// 本机明文 HTTP 请求，返回响应正文
+/// 本机明文 HTTP 请求，返回响应正文。浏览器的调试端口不理 Connection: close，回完不断开，
+/// 所以正文按 Content-Length 读，没有这个头才读到对方断开
 fn get(port: u16, method: &str, path: &str, key: Option<&str>) -> Result<String, String> {
-    let req = || -> std::io::Result<String> {
+    let req = || -> std::io::Result<(String, String)> {
         let mut s = TcpStream::connect(("127.0.0.1", port))?;
         s.set_read_timeout(Some(Duration::from_secs(90)))?;
         let auth = key.map(|k| format!("Authorization: Bearer {k}\r\n")).unwrap_or_default();
         write!(s, "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n{auth}Content-Length: 0\r\nConnection: close\r\n\r\n")?;
-        let mut buf = String::new();
-        s.read_to_string(&mut buf)?;
-        Ok(buf)
+        let mut r = BufReader::new(s);
+        let mut head = String::new();
+        // 读到空行（只有 \r\n）或断开为止
+        while r.read_line(&mut head)? > 2 {}
+        let len = head.lines().find_map(|l| {
+            let (k, v) = l.split_once(':')?;
+            k.eq_ignore_ascii_case("content-length").then(|| v.trim().parse().ok())?
+        });
+        let mut body = String::new();
+        r.take(len.unwrap_or(u64::MAX)).read_to_string(&mut body)?;
+        Ok((head, body))
     };
-    let resp = req().map_err(|e| format!("127.0.0.1:{port}: {e}"))?;
-    let (head, body) = resp.split_once("\r\n\r\n").ok_or("bad reply")?;
+    let (head, body) = req().map_err(|e| format!("127.0.0.1:{port}: {e}"))?;
     match head.split(' ').nth(1) {
-        Some("200") => Ok(body.to_string()),
+        Some("200") => Ok(body),
         status => Err(format!("127.0.0.1:{port}: HTTP {}", status.unwrap_or("?"))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::TcpListener;
+
+    #[test]
+    fn reads_reply_without_close() {
+        // 像浏览器调试端口一样回完不断开：连接留在线程返回值里，join 前不关
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (mut s, _) = l.accept().unwrap();
+            let _ = s.read(&mut [0; 1024]);
+            s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length:7\r\nContent-Type:application/json\r\n\r\n{\"a\":1}").unwrap();
+            s
+        });
+        assert_eq!(get(port, "PUT", "/json/new?x", None).unwrap(), "{\"a\":1}");
+        drop(server.join());
     }
 }

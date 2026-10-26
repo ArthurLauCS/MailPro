@@ -216,6 +216,11 @@ impl Store {
         )
     }
 
+    /// 最新一封的收到时间（INTERNALDATE），空文件夹为 0
+    pub fn latest(&self, folder: i64) -> Result<i64> {
+        self.0.query_row("SELECT COALESCE(MAX(date), 0) FROM message WHERE folder = ?1", [folder], |r| r.get(0))
+    }
+
     /// 返回新增封数；已有的不覆盖，标记由 [`Store::set_flags`] 更新
     pub fn put_headers(&self, folder: i64, headers: &[Header]) -> Result<usize> {
         let tx = self.0.unchecked_transaction()?;
@@ -367,8 +372,10 @@ mod tests {
         assert_eq!(db.remove(f, &[1, 9]).unwrap(), 1);
         assert!(db.pending(f).unwrap().is_empty() && db.body(f, 1).unwrap().is_none());
 
+        // 测试邮件的收到时间等于 uid
+        assert_eq!(db.latest(f).unwrap(), 3);
         db.reset_folder(f, 7).unwrap();
-        assert_eq!(db.max_uid(f).unwrap(), 0);
+        assert_eq!((db.max_uid(f).unwrap(), db.latest(f).unwrap()), (0, 0));
         db.set_folders(acc, &[]).unwrap();
         assert!(db.folders(acc).unwrap().is_empty());
     }

@@ -3,7 +3,7 @@
 //! 不跑脚本；所有请求都进 `WebResourceRequested`，只有 [`BASE`] 下的正文和内嵌图片有应答，
 //! 远程图片（`img/n`）挂起后交给界面决定是否代取，其余在本地回 403，内核自己从不出网；
 //! 所有页面跳转都取消，点链接只把编号报给界面。
-//! 整个程序一个实例，换邮件时改 [`Current`] 再 [`show`]。
+//! 整个程序一个实例（系统换深浅色时重建），换邮件时改 [`Current`] 再 [`show`]。
 //! 创建全程走异步回调（由 gpui 的消息循环派发），不嵌套消息循环，避免重入 gpui。
 
 use futures::channel::mpsc::UnboundedSender;
@@ -66,16 +66,19 @@ const BROWSER_ARGS: &str = "--disable-background-networking --disable-component-
 /// 正在显示的邮件；请求正文和内嵌图片时从这里取
 pub type Current = Rc<RefCell<Option<Message>>>;
 
-/// 异步创建查看器，建好后发出 [`Event::Ready`]
-pub fn create(hwnd: HWND, msg: Current, tx: UnboundedSender<Event>) -> Result<()> {
-    let data = std::env::var("LOCALAPPDATA").unwrap_or_default() + "\\MailPro\\WebView2";
+/// 异步创建查看器，建好后发出 [`Event::Ready`]。
+/// `dark`：用 Chromium 的自动深色把正文变深，`bg` 为页面没写底色时的底色。
+/// 这个开关只能在创建时给，换深浅色要重建；两种参数的内核不能共用一个数据目录，所以分开放
+pub fn create(hwnd: HWND, msg: Current, tx: UnboundedSender<Event>, dark: Option<COREWEBVIEW2_COLOR>) -> Result<()> {
+    let data = std::env::var("LOCALAPPDATA").unwrap_or_default() + if dark.is_some() { "\\MailPro\\WebView2Dark" } else { "\\MailPro\\WebView2" };
     let options = CoreWebView2EnvironmentOptions::default();
     // 关掉内核自己的后台联网：组件更新、域名可靠性上报等
-    unsafe { options.set_additional_browser_arguments(BROWSER_ARGS.into()) };
+    let args = if dark.is_some() { format!("{BROWSER_ARGS} --enable-features=WebContentsForceDark") } else { BROWSER_ARGS.into() };
+    unsafe { options.set_additional_browser_arguments(args) };
     let handler = CreateCoreWebView2EnvironmentCompletedHandler::create(Box::new(move |hr, env| {
         hr?;
         let env = env.ok_or(Error::from(E_POINTER))?;
-        unsafe { create_controller(hwnd, env, msg, tx) }.inspect_err(|e| eprintln!("WebView2: {e}"))
+        unsafe { create_controller(hwnd, env, msg, tx, dark) }.inspect_err(|e| eprintln!("WebView2: {e}"))
     }));
     unsafe {
         CreateCoreWebView2EnvironmentWithOptions(
@@ -87,7 +90,7 @@ pub fn create(hwnd: HWND, msg: Current, tx: UnboundedSender<Event>) -> Result<()
     }
 }
 
-unsafe fn create_controller(hwnd: HWND, env: ICoreWebView2Environment, msg: Current, tx: UnboundedSender<Event>) -> Result<()> {
+unsafe fn create_controller(hwnd: HWND, env: ICoreWebView2Environment, msg: Current, tx: UnboundedSender<Event>, dark: Option<COREWEBVIEW2_COLOR>) -> Result<()> {
     unsafe {
         let env10: ICoreWebView2Environment10 = env.cast()?;
         let opts = env10.CreateCoreWebView2ControllerOptions()?;
@@ -96,6 +99,9 @@ unsafe fn create_controller(hwnd: HWND, env: ICoreWebView2Environment, msg: Curr
         let handler = CreateCoreWebView2ControllerCompletedHandler::create(Box::new(move |hr, c| {
             hr?;
             let c = c.ok_or(Error::from(E_POINTER))?;
+            if let Some(bg) = dark {
+                c.cast::<ICoreWebView2Controller2>()?.SetDefaultBackgroundColor(bg)?;
+            }
             setup(&env, &c, msg, tx.clone()).inspect_err(|e| eprintln!("WebView2: {e}"))?;
             let _ = tx.unbounded_send(Event::Ready(c));
             Ok(())
