@@ -1,14 +1,16 @@
-//! 发信：用 lettre 拼成纯文本邮件，经邮箱的代理（[`imap::tcp`]）连 SMTP 发出，只走隐式 TLS。
+//! 发信：用 lettre 拼成纯文本邮件，经邮箱的代理（[`imap::tcp`]）连 SMTP 发出。587 端口明文连上后
+//! STARTTLS 升级（Outlook），其他端口隐式 TLS；密码账号 PLAIN / LOGIN 登录，Outlook 用 XOAUTH2。
 //! 发信头脱敏：EHLO 报 `[127.0.0.1]` 不报主机名，Message-ID 是随机串加发件人的域名，Date 用 UTC，
 //! 不带 User-Agent / X-Mailer。
 
+use crate::auth::Secret;
 use crate::imap::{self, Io, Result};
 use crate::store::Account;
 use lettre::address::Envelope;
 use lettre::message::header::ContentType;
 use lettre::message::{Mailbox, Message};
 use lettre::transport::smtp::authentication::{Credentials, Mechanism};
-use lettre::transport::smtp::client::{AsyncSmtpConnection, AsyncTokioStream};
+use lettre::transport::smtp::client::{AsyncSmtpConnection, AsyncTokioStream, TlsParameters};
 use lettre::transport::smtp::extension::ClientId;
 use percent_encoding::percent_decode_str;
 use std::net::{Ipv4Addr, SocketAddr};
@@ -97,24 +99,40 @@ pub fn build(acc: &Account, m: &Mail) -> std::result::Result<Built, String> {
     Ok(Built { send: make(false)?, copy: make(true)?, envelope })
 }
 
-/// 经代理连发信服务器，TLS 后登录发出
-pub async fn send(acc: &Account, secret: &str, b: &Built) -> Result<()> {
+/// 经代理连发信服务器，加密后登录发出。587 端口先明文连上再 STARTTLS，服务器不支持就报错不发，
+/// 密码、令牌不走明文；其他端口一连上就 TLS
+pub async fn send(acc: &Account, secret: &Secret, b: &Built) -> Result<()> {
+    let pass = secret.get(&acc.email, acc.proxy.as_deref()).await?;
     let tcp = imap::tcp(acc.proxy.as_deref(), &acc.smtp_host, acc.smtp_port).await?;
-    let tls = TlsConnector::from(native_tls::TlsConnector::new()?).connect(&acc.smtp_host, tcp).await?;
-    deliver(tls, &acc.email, secret, b).await
+    let mut c = if acc.smtp_port == 587 {
+        let mut c = connect(tcp).await?;
+        c.starttls(TlsParameters::new(acc.smtp_host.clone())?, &HELLO).await?;
+        c
+    } else {
+        connect(TlsConnector::from(native_tls::TlsConnector::new()?).connect(&acc.smtp_host, tcp).await?).await?
+    };
+    deliver(&mut c, &acc.email, &pass, secret.is_oauth(), b).await
 }
 
-/// 在连好的流上登录发出；测试可以用明文 TCP 连本地测试服务器
-pub async fn deliver<T: Io + Sync + 'static>(stream: T, user: &str, secret: &str, b: &Built) -> Result<()> {
+/// EHLO 报 `[127.0.0.1]`，不报主机名
+const HELLO: ClientId = ClientId::Ipv4(Ipv4Addr::LOCALHOST);
+
+/// 在连好的流上开始 SMTP 会话；测试可以用明文 TCP 连本地测试服务器
+pub async fn connect<T: Io + Sync + 'static>(stream: T) -> Result<AsyncSmtpConnection> {
+    Ok(AsyncSmtpConnection::connect_with_transport(Box::new(Wire(stream)), &HELLO).await?)
+}
+
+/// 登录发出：`oauth` 时 `secret` 是访问令牌，用 XOAUTH2
+pub async fn deliver(c: &mut AsyncSmtpConnection, user: &str, secret: &str, oauth: bool, b: &Built) -> Result<()> {
     let envelope = b.envelope.as_ref().ok_or("no recipients")?;
-    let mut c = AsyncSmtpConnection::connect_with_transport(Box::new(Wire(stream)), &ClientId::Ipv4(Ipv4Addr::LOCALHOST)).await?;
-    c.auth(&[Mechanism::Plain, Mechanism::Login], &Credentials::new(user.into(), secret.into())).await?;
+    let mechanisms: &[_] = if oauth { &[Mechanism::Xoauth2] } else { &[Mechanism::Plain, Mechanism::Login] };
+    c.auth(mechanisms, &Credentials::new(user.into(), secret.into())).await?;
     c.send(envelope, &b.send).await?;
     let _ = c.quit().await;
     Ok(())
 }
 
-/// 发信服务器默认按收信服务器推：`imap.` 开头换成 `smtp.`，否则同一个主机
+/// 手填服务器的邮箱，发信服务器留空时按收信服务器推：`imap.` 开头换成 `smtp.`，否则同一个主机
 pub fn default_host(imap_host: &str) -> String {
     imap_host.strip_prefix("imap.").map_or_else(|| imap_host.to_string(), |h| format!("smtp.{h}"))
 }
@@ -145,7 +163,7 @@ pub fn mailto(raw: &str) -> Option<Mail> {
     Some(m)
 }
 
-/// 把 TLS 流交给 lettre：它只收实现了 [`AsyncTokioStream`] 的流
+/// 把连好的流交给 lettre：它只收实现了 [`AsyncTokioStream`] 的流
 #[derive(Debug)]
 struct Wire<T>(T);
 

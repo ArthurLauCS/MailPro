@@ -1,3 +1,4 @@
+pub mod auth;
 pub mod cred;
 pub mod engine;
 pub mod http;

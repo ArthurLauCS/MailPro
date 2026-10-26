@@ -1,13 +1,14 @@
 //! 后台同步：单独一个线程跑 tokio。每个账号两条连接：一条常驻同步（IDLE + 定时同步），
 //! 一条按需连上，取正文、写回标记、移动删除、存草稿和已发送，不排在同步后面。界面只发 [`Cmd`]、收 [`Event`]，
 //! 邮件头由界面自己开数据库连接读。发信、代取允许加载的远程图片也在这里，各开新连接。
+//! 同一个账号的连接共用一份登录凭据（[`Secret`]），Outlook 的访问令牌只换一次。
 
+use crate::auth::{self, Secret};
 use crate::http;
 use crate::imap::{self, Result, Session};
 use crate::message::{self, Message};
 use crate::smtp::{self, Built};
 use crate::store::{Account, Folder, Store};
-use crate::cred;
 use futures::StreamExt;
 use futures::channel::mpsc::{UnboundedReceiver, UnboundedSender, unbounded};
 use futures::channel::oneshot;
@@ -23,8 +24,11 @@ pub enum Cmd {
     Flush { account: i64, folder: Folder },
     /// 移到 `to`，None 为彻底删除。界面已先从本地删掉；失败时重新同步原文件夹，邮件回来
     Move { account: i64, folder: Folder, uids: Vec<u32>, to: Option<Folder> },
-    /// 试登录，通过才存密码、存账号、开始同步；密码先经 [`imap::tidy_secret`]
+    /// 试登录，通过才存密码、存账号、开始同步；密码先经 [`imap::tidy_secret`]。
+    /// Outlook 不用密码：先发 [`Event::Browse`] 在浏览器里登录，5 分钟没回来算超时；已有的账号再来一次即重新登录
     Add(Account, String),
+    /// 取消正在进行的 Outlook 浏览器登录（关掉了对话框），回环监听随之关闭
+    Cancel,
     /// 账号设置（代理）改了，按新设置重连
     Restart(i64),
     /// 经代理取一张远程图片，回 (Content-Type, 内容)，失败回 None
@@ -45,6 +49,10 @@ pub enum Event {
     Body { folder: i64, uid: u32, msg: std::result::Result<Message, BodyError> },
     /// 连接断了，稍后自动重连；account 为 0 是数据库打不开
     Error { account: i64, msg: String },
+    /// Outlook 的授权失效，不再重连，要在账号设置里重新登录
+    Expired(i64),
+    /// Outlook 登录：用浏览器打开这个授权地址
+    Browse(String),
     /// 添加账号的结果：账号 id 或失败原因
     Added(std::result::Result<i64, String>),
     /// 移动、删除、存已发送失败的原因
@@ -67,10 +75,14 @@ enum Job {
     Append(Folder, Vec<u8>, &'static str, Option<Reply>),
 }
 
+/// 等浏览器登录回来的时限，超时后关掉监听，对话框里报原因
+const LOGIN: Duration = Duration::from_secs(5 * 60);
+
 struct Running {
     sync: JoinHandle<()>,
     worker: JoinHandle<()>,
     jobs: UnboundedSender<Job>,
+    secret: Rc<Secret>,
 }
 
 impl Drop for Running {
@@ -98,6 +110,8 @@ async fn run(path: String, mut cmds: UnboundedReceiver<Cmd>, again: UnboundedSen
         Err(e) => return drop(tx.unbounded_send(Event::Error { account: 0, msg: e.to_string() })),
     };
     let mut running = HashMap::new();
+    // 正在进行的 Outlook 浏览器登录；同时只有一个添加 / 设置对话框，新的顶掉旧的
+    let mut login: Option<JoinHandle<()>> = None;
     for acc in db.accounts().unwrap_or_default() {
         start(&db, acc, &mut running, &tx);
     }
@@ -107,14 +121,24 @@ async fn run(path: String, mut cmds: UnboundedReceiver<Cmd>, again: UnboundedSen
             Cmd::Flush { account, folder } => (account, Job::Flush(folder)),
             Cmd::Move { account, folder, uids, to } => (account, Job::Move(folder, uids, to)),
             Cmd::Add(acc, secret) => {
+                let oauth = imap::oauth_only(&acc.email);
                 let (db, tx, again) = (db.clone(), tx.clone(), again.clone());
-                spawn_local(async move {
-                    let r = add(&db, &acc, &secret).await.map_err(|e| e.to_string());
+                let task = spawn_local(async move {
+                    let r = add(&db, &acc, &secret, &tx).await.map_err(|e| e.to_string());
                     if let Ok(id) = r {
                         let _ = again.unbounded_send(Cmd::Restart(id));
                     }
                     let _ = tx.unbounded_send(Event::Added(r));
                 });
+                if oauth && let Some(old) = login.replace(task) {
+                    old.abort();
+                }
+                continue;
+            }
+            Cmd::Cancel => {
+                if let Some(t) = login.take() {
+                    t.abort();
+                }
                 continue;
             }
             Cmd::Restart(id) => {
@@ -134,9 +158,9 @@ async fn run(path: String, mut cmds: UnboundedReceiver<Cmd>, again: UnboundedSen
             }
             Cmd::Send { account, mail, sent, reply } => {
                 let Some(acc) = db.accounts().unwrap_or_default().into_iter().find(|a| a.id == account) else { continue };
-                let again = again.clone();
+                let (again, secret) = (again.clone(), running.get(&account).map(|r| r.secret.clone()));
                 spawn_local(async move {
-                    let r = send(&acc, &mail).await.map_err(|e| e.to_string());
+                    let r = send(&acc, secret, &mail).await.map_err(|e| e.to_string());
                     if let (Ok(()), Some(folder)) = (&r, sent) {
                         let _ = again.unbounded_send(Cmd::Append { account, folder, raw: mail.copy, flags: "(\\Seen)", reply: None });
                     }
@@ -157,38 +181,45 @@ async fn run(path: String, mut cmds: UnboundedReceiver<Cmd>, again: UnboundedSen
     }
 }
 
-async fn add(db: &Store, acc: &Account, secret: &str) -> Result<i64> {
-    let secret = imap::tidy_secret(&acc.host, secret);
+/// 试登录，通过才存凭据和账号。Outlook 先在浏览器里登录（经 `tx` 发出授权地址），拿到的令牌即刻试登录
+async fn add(db: &Store, acc: &Account, secret: &str, tx: &UnboundedSender<Event>) -> Result<i64> {
+    let secret = if imap::oauth_only(&acc.email) {
+        let browse = |url| drop(tx.unbounded_send(Event::Browse(url)));
+        tokio::time::timeout(LOGIN, auth::sign_in(&acc.email, acc.proxy.as_deref(), browse)).await.map_err(|_| "sign-in timeout")??
+    } else {
+        Secret::Password(imap::tidy_secret(&acc.host, secret))
+    };
     imap::connect(acc, &secret).await?.logout().await?;
-    cred::save(&acc.email, &secret)?;
+    secret.save(&acc.email).await?;
     Ok(db.add_account(acc)?)
 }
 
 fn start(db: &Rc<Store>, acc: Account, running: &mut HashMap<i64, Running>, tx: &UnboundedSender<Event>) {
     let id = acc.id;
-    let secret = match cred::load(&acc.email) {
-        Ok(s) => s,
+    let secret = match Secret::load(&acc.email) {
+        Ok(s) => Rc::new(s),
         Err(e) => return drop(tx.unbounded_send(Event::Error { account: id, msg: e.to_string() })),
     };
     let (jobs, rx) = unbounded();
     let acc = Rc::new(acc);
     let (db2, acc2, secret2, tx2) = (db.clone(), acc.clone(), secret.clone(), tx.clone());
     let worker = spawn_local(async move { worker(&db2, &acc2, &secret2, rx, &tx2).await });
-    let (db, tx) = (db.clone(), tx.clone());
+    let (db, tx, secret2) = (db.clone(), tx.clone(), secret.clone());
     let sync = spawn_local(async move {
-        imap::watch(&db, &acc, &secret, |e| {
+        imap::watch(&db, &acc, &secret2, |e| {
             let _ = tx.unbounded_send(match e {
                 imap::Event::Folders => Event::Folders(id),
                 imap::Event::Changed(f, _) => Event::Changed { account: id, folder: f.id },
                 imap::Event::Error(msg) => Event::Error { account: id, msg },
+                imap::Event::Expired(_) => Event::Expired(id),
             });
         })
         .await
     });
-    running.insert(id, Running { sync, worker, jobs });
+    running.insert(id, Running { sync, worker, jobs, secret });
 }
 
-async fn worker(db: &Store, acc: &Account, secret: &str, mut rx: UnboundedReceiver<Job>, tx: &UnboundedSender<Event>) {
+async fn worker(db: &Store, acc: &Account, secret: &Secret, mut rx: UnboundedReceiver<Job>, tx: &UnboundedSender<Event>) {
     let mut slot = None;
     while let Some(first) = rx.next().await {
         let mut jobs = vec![first];
@@ -241,7 +272,7 @@ async fn worker(db: &Store, acc: &Account, secret: &str, mut rx: UnboundedReceiv
 }
 
 /// 同步一个文件夹，有变化就告诉界面
-async fn resync(slot: &mut Option<Session>, db: &Store, acc: &Account, secret: &str, f: &Folder, tx: &UnboundedSender<Event>) {
+async fn resync(slot: &mut Option<Session>, db: &Store, acc: &Account, secret: &Secret, f: &Folder, tx: &UnboundedSender<Event>) {
     if let Ok(ch) = with_session(slot, acc, secret, async |s| imap::sync_folder(s, db, f).await).await
         && !ch.is_empty()
     {
@@ -249,9 +280,12 @@ async fn resync(slot: &mut Option<Session>, db: &Store, acc: &Account, secret: &
     }
 }
 
-/// 取出密码发信；连接卡住时 60 秒后放弃，写信框不会一直显示发送中
-async fn send(acc: &Account, mail: &Built) -> Result<()> {
-    let secret = cred::load(&acc.email)?;
+/// 用账号同步连接的那份凭据发信，没在同步就现取；连接卡住时 60 秒后放弃，写信框不会一直显示发送中
+async fn send(acc: &Account, secret: Option<Rc<Secret>>, mail: &Built) -> Result<()> {
+    let secret = match secret {
+        Some(s) => s,
+        None => Rc::new(Secret::load(&acc.email)?),
+    };
     tokio::time::timeout(Duration::from_secs(60), smtp::send(acc, &secret, mail)).await.map_err(|_| "timeout")?
 }
 
@@ -259,7 +293,7 @@ async fn send(acc: &Account, mail: &Built) -> Result<()> {
 async fn with_session<T>(
     slot: &mut Option<Session>,
     acc: &Account,
-    secret: &str,
+    secret: &Secret,
     mut op: impl AsyncFnMut(&mut Session) -> Result<T>,
 ) -> Result<T> {
     if let Some(s) = slot.as_mut() {

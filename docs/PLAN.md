@@ -11,7 +11,7 @@
 | 正文渲染 | 嵌入 gpui 窗口的 WebView2 子窗口，锁死：不跑脚本、所有网络请求本地拦截 |
 | 协议 | 全部 IMAP + SMTP；不支持 POP3（不同步已读状态） |
 | Gmail | 应用专用密码；另允许填自己的 OAuth client |
-| Outlook / Hotmail | **无限期推后**，先只做 Gmail。要做时走 OAuth2（Entra 注册的应用，桌面公共客户端 + PKCE + 回环地址）：Outlook.com 的 IMAP 只收 XOAUTH2，个人账号要先有 Entra 租户才能注册应用 |
+| Outlook / Hotmail | OAuth2：Entra 注册的公共客户端（仅个人账户），系统浏览器登录 + PKCE + 回环地址；IMAP、SMTP 都用 XOAUTH2 |
 | 代理 | 邮箱连接固定走代理，不漏真实 IP（细节见第三步） |
 | 打开链接 | 用用户自选的浏览器：系统默认、指定程序或 AdsPower 环境（SunBrowser），见第四步 |
 | 写信 | MVP 只做纯文本与引用回复，HTML 编辑以后 |
@@ -42,14 +42,19 @@ tests/privacy  跟踪测试邮件 + 本地计数服务器
 1. **正文查看器原型**（已完成）：gpui 窗口嵌 WebView2，打开一封 .eml，走完上面四道防线。
    - 验证：清洗的单元测试通过；`tests/privacy/tracking.eml` 含 30 多种跟踪手段，无防护的 headless Chrome 打开后计数服务器收到 31 种；MailPro 打开同一封，命中 0；内嵌图片、中文排版正常；点链接被拦下，只把原地址报给界面。
    - 复现：`python tests/privacy/tracker.py serve <log>` 起计数服务器，再用 `scripts/drive.ps1` 不抢焦点地启动并截图（用法见脚本头部）。
-2. **账号与 IMAP 同步**（已完成，Outlook 无限期推后）：Gmail（应用专用密码）、其他 IMAP 邮箱（手填服务器，只走 TLS）；SQLite 存邮件头和标记；IDLE 实时推送；已读标记回写服务器。
+2. **账号与 IMAP 同步**（已完成）：Gmail（应用专用密码）、Outlook / Hotmail（浏览器登录，XOAUTH2）、其他 IMAP 邮箱（手填服务器，只走 TLS）；SQLite 存邮件头和标记；IDLE 实时推送；已读标记回写服务器。
    - 同步规则：全部文件夹的邮件头全量同步；Gmail 按 IMAP 文件夹原样存（All Mail 也同步，不去重）；首次同步从新到旧分批拉，断了下次接着补；收件箱 IDLE 实时，全部文件夹每 5 分钟同步一次；服务器支持 CONDSTORE 时只拉改过的标记。列表不显示正文摘要。正文按需下载，原始邮件存进 SQLite，不清理。标已读先改本地并记待写回，同步该文件夹时写回，邮件已被删就丢弃。断线重连从 5 秒起翻倍，封顶 5 分钟，一直重试。
-   - 代码：`crates/core` 的 `store`（SQLite，`%LOCALAPPDATA%\MailPro\mail.db`）、`imap`（同步、IDLE）、`cred`（凭据管理器）；验证工具 `mailpro-cli`（用法见文件头）。
+   - 代码：`crates/core` 的 `store`（SQLite，`%LOCALAPPDATA%\MailPro\mail.db`）、`imap`（同步、IDLE）、`cred`（凭据管理器）、`auth`（Outlook 登录和令牌）；验证工具 `mailpro-cli`（用法见文件头）。
    - 验证：两个真实账号的收件箱与网页版一致；一边标已读，另一边几秒内变化。本地部分由 `crates/core/tests/sync.rs` 对 GreenMail 测试服务器验证（跑法见文件头）；GreenMail 不推送其他连接改的标记，“另一边几秒内变化”只能用真实账号验证。
    - 现状：Gmail 和手填服务器部分已完成，真实 Gmail 验证通过：各文件夹数量与网页版一致；本地标已读 2 秒内写回；网页改标记、新信进收件箱都在几秒内推到本地；其他文件夹随 5 分钟同步跟上；Gmail 支持 CONDSTORE，只拉改过的标记。Gmail 自填 OAuth client 不在这一步。
-   - Outlook（无限期推后）：Outlook.com 的 IMAP 只收 XOAUTH2（`LOGINDISABLED`，密码登录回 `Basic authentication is disabled`，网页设置里的 IMAP 开关只管协议不管登录方式）；个人账号不能在目录外注册应用，要先有 Entra 租户，Azure 免费账户注册没通过。要做时：`common` 端点（个人和工作 / 学校账号都支持），授权时一并申请 SMTP 发信；Outlook 不支持 CONDSTORE，每次同步拉全部标记。
+   - Outlook / Hotmail：Outlook.com 的 IMAP 只收 XOAUTH2（`LOGINDISABLED`，密码登录回 `Basic authentication is disabled`），网页版设置里的 IMAP 开关要打开。服务器固定：`outlook.office365.com:993`（隐式 TLS），发信 `smtp-mail.outlook.com:587`（STARTTLS）。Outlook 不支持 CONDSTORE，每次同步拉全部标记。
+   - Outlook 应用：Entra 注册的 MailPro，仅个人 Microsoft 账户，公共客户端（移动和桌面），回调 `http://localhost`，没有客户端密码；Client ID 在 `auth.rs`。端点 `login.microsoftonline.com/consumers/oauth2/v2.0`；scope 为 `https://outlook.office.com/IMAP.AccessAsUser.All`、`https://outlook.office.com/SMTP.Send`、`offline_access`。
+   - Outlook 登录：授权码 + PKCE（S256）。本机在 `127.0.0.1` 和 `[::1]` 的同一个随机端口临时监听，`redirect_uri` 为 `http://localhost:{端口}`（localhost 回调不比端口）；授权地址带 `login_hint=邮箱`、`prompt=select_account`。回调核对 state，不符的请求（含 favicon）回 404、接着等；用户拒绝或授权出错时浏览器显示失败页，原因报给对话框。5 分钟没回来算超时，关掉对话框即取消；成功、失败、超时、取消后监听都关掉。拿到令牌先用这个邮箱试登录 IMAP，通过才存。授权地址按左栏“浏览器”菜单打开（系统默认、指定程序或 AdsPower 环境），登录页的网络即该浏览器的网络（AdsPower 环境走环境自己的代理）；只有回调走本机回环。
+   - Outlook 令牌：刷新令牌存凭据管理器（`MailPro/邮箱`，和密码同一处），刷新时拿到新的就换掉；访问令牌只在内存，过期前 5 分钟刷新，同一邮箱的同步连接、后台操作连接和发信共用一份，刷新串行。令牌请求经该邮箱的 SOCKS5 代理，代理连不上直接报错，不退回直连；没设代理则直连。令牌不进日志。多个 Outlook 邮箱共用一个 Client ID，各自登录、各存一份令牌、各自同步。
+   - Outlook 授权失效：令牌端点回 4xx 且带 `error`（`temporarily_unavailable` 除外，如 `invalid_grant`）即失效：停止同步、不再重连，左栏显示“授权已失效”，在账号设置里点“重新登录”；网络错误、5xx 照常退避重连。
+   - Outlook 现状：PKCE（RFC 7636 向量）、回调处理、令牌响应、XOAUTH2 对假服务器的单元测试通过；真实登录、刷新、同步、发信、失效后重新登录待用户实测。
 3. **主界面与代理**（已完成）
-   - 代理：每个邮箱单独设 SOCKS5 代理（`主机:端口`，不带用户名密码），域名交给代理解析，本机不查 DNS；代理连不上直接报错，绝不退回直连；没设代理的邮箱直连，设置里标“直连”警示。MailPro 自己的连接（IMAP、第六步的 SMTP）都走它；点链接后的流量归浏览器自己管。
+   - 代理：每个邮箱单独设 SOCKS5 代理（`主机:端口`，不带用户名密码），域名交给代理解析，本机不查 DNS；代理连不上直接报错，绝不退回直连；没设代理的邮箱直连，设置里标“直连”警示。MailPro 自己的连接（IMAP、第六步的 SMTP、Outlook 的令牌请求）都走它；点链接后和 Outlook 登录页的流量归浏览器自己管。
    - 界面：三栏（账号和文件夹 / 邮件列表（虚拟列表）/ 阅读区），栏宽可拖。左栏按账号分组：账号行有展开箭头和首字母圆标（色相按账号 id 取黄金分割步进），点它收起 / 展开；收起时显示收件箱未读数和断线红点，正在看的文件夹在里面时账号行高亮；收起状态存设置 `collapsed`，重启后保持。账号行拖到另一个账号上即排到它的位置，顺序存设置 `order`（空格分隔的 id），没排过的按添加顺序接在后面。收件箱 30 分钟内收到过邮件（按 INTERNALDATE，已读也算，其他文件夹不算）时账号行泛光：淡淡的强调色底加一圈柔光，到点自动熄灭（只在最早熄灭的时刻排一次重画，不逐帧刷新）。文件夹、附件、星标、设置等用 Lucide 线条图标（gpui-kit-assets 的 `AllAssets`）。列表顶部显示文件夹、账号和封数，选中行左侧一条主题色竖条。阅读区头部为主题、发件人与时间、远程资源提示条（盾牌图标，加载按钮在右）。打开邮件即标已读；Gmail 系统文件夹按界面语言显示，固定顺序为收件箱、已加星标、重要、已发送、草稿、所有邮件、垃圾邮件、已删除，再接自建标签；添加账号对话框填邮箱、应用专用密码、代理，非 Gmail 再填服务器和端口；列表一行显示未读圆点、发件人、主题、时间、附件、星标（只显示）；界面中英双语，语言和深浅色默认跟随系统；左栏底部为添加账号，浏览器、语言两个图标按钮（悬停出文字）。
    - 外观：和 PushRight 同一套设计令牌（`crates/app/src/theme.rs`）：暖调的象牙白与炭黑，内容区、左栏、浮起控件三层底色；全应用唯一的强调色取图标粉，当文字和线条用的一档深色主题取亮（`#f472b6`）、浅色取深（`#be185d`），压着白字的底色（主按钮、未读圆点）两个主题都是 `#db2777`；选中行是强调色 12% 的淡底，选中的文件夹字和图标也用强调色。字体：控件 Segoe UI Variable，标题和名字（阅读区主题、列表顶部文件夹名、对话框标题）思源宋体，给人读的整段话（空状态、说明）霞鹜文楷；两套字体由 `scripts/fonts.ps1` 下载（不进 git，约 50 MB），安装到 exe 旁的 `fonts` 目录，找不到时退回系统字体。系统标题栏经 DWM 跟应用深浅色一致。
    - 深色正文：深色时 WebView2 带 `--enable-features=WebContentsForceDark`（Chromium 的自动深色：浅色底变深、照片和彩色块基本保持），页面没写底色处用界面底色。这个参数只能在建内核时给，系统换深浅色时关掉旧查看器重建；两种参数的内核不能共用数据目录，分别放 `WebView2` 和 `WebView2Dark`。
@@ -80,16 +85,16 @@ tests/privacy  跟踪测试邮件 + 本地计数服务器
    - 代码：`crates/core` 的 `imap::move_to`、`store::mark`；`crates/app` 的 `view`（`Act` 为各项操作）。
    - 验证：GreenMail 测试（`crates/core/tests/sync.rs`）覆盖星标写回、移动、彻底删除；界面用测试库截图核对右键菜单、操作栏、移动对话框、全部标为已读、断线时删除的提示。
    - 现状：以上验证通过。多选（Ctrl / Shift 点无法用投递的消息模拟）、右键菜单开着时正文藏起、真实 Gmail 上的移动 / 删除 / 归档由用户实测。
-6. **写信与发送**（已完成）：纯文本写信、回复、全部回复、转发，经邮箱的代理连 SMTP 发出（lettre，只走隐式 TLS，不支持 STARTTLS）。
+6. **写信与发送**（已完成）：纯文本写信、回复、全部回复、转发，经邮箱的代理连 SMTP 发出（lettre）。587 端口走 STARTTLS，服务器不支持就报错，不明文发；其他端口隐式 TLS。Outlook 用 XOAUTH2，其他用密码。
    - 入口：列表顶部的写信按钮；阅读区头部的回复、全部回复、转发（正文到了才显示）；正文里的 mailto: 链接（RFC 6068 的收件人、抄送、密送、主题、正文）；点草稿文件夹里的一封接着写。写信框是对话框。
    - 发件人：默认正在看的那封所属的账号，否则选中文件夹的账号；多个账号时可在下拉里换。显示名取账号设置里的“发信名字”，空则只写地址。
    - 收件人：默认只显示收件人一栏，“抄送 / 密送”展开另两栏（打开时已有内容自动展开）；逗号或分号分隔，不做自动补全。
    - 回复：回给 Reply-To，没有就回发件人；全部回复再加原收件人和抄送；都去掉自己和重复的，回自己发的信时改回给原收件人。主题加 `Re: `；正文上方留空，下面是“{时间}，{发件人} 写道：”和逐行加 `> ` 的原文；带 In-Reply-To、References；发出后原信标已回复（`\Answered`）。转发：主题加 `Fwd: `，正文带原信头部（发件人、日期、主题、收件人、抄送）和原文，不带附件。写信不能加附件。
    - 发信头脱敏：EHLO 报 `[127.0.0.1]`；Message-ID 是 32 位随机串加发件人的域名；Date 一律 UTC，回复、转发引文里的时间也用 UTC；不带 User-Agent / X-Mailer。发出的那份不带 Bcc 头，存进已发送 / 草稿的那份带。
-   - 已发送：Gmail 自己存；其他邮箱发出后 IMAP APPEND 一份进已发送文件夹（标已读），没有已发送文件夹就不存。
+   - 已发送：Gmail 自己存；其他邮箱（含 Outlook，它若自己也存会多一份，待实测）发出后 IMAP APPEND 一份进已发送文件夹（标已读），没有已发送文件夹就不存。
    - 草稿：关掉写信框（Esc、右上角关闭）时内容或发件账号改过就存进草稿文件夹（`\Draft \Seen`），不问；存好才关，存不了（账号没连上、没有草稿文件夹、地址有误）时提示原因、窗口留着，可以点丢弃。接着写的旧草稿在发出、存了新的或丢弃后删掉：有所有邮件文件夹的账号（Gmail）移到已删除，否则彻底删除。由回复存成的草稿接着写后发出，不再给原信标已回复。
    - 发送：先查地址、收件人、账号连着没有；超时 60 秒；失败时提示原因，窗口留着可以重试。发送、存草稿中按钮置灰，关不掉。
-   - 账号设置：发信名字、SMTP 服务器和端口（Gmail 不显示服务器）；SMTP 服务器留空时按 IMAP 服务器推（`imap.` 换成 `smtp.`），端口默认 465。
+   - 账号设置：发信名字、SMTP 服务器和端口（Gmail、Outlook 固定，不显示）；SMTP 服务器留空时按 IMAP 服务器推（`imap.` 换成 `smtp.`），端口默认 465。
    - 代码：`crates/core` 的 `smtp`（拼信、发信、mailto）、`message::original`（回复、转发、草稿用的原信内容）、`imap::append`、`engine` 的 `Cmd::Send` / `Cmd::Append`；`crates/app` 的 `view/compose.rs`。
    - 验证：`smtp::tests`（头部脱敏、地址拆分和拼回、mailto）、`message::tests::prepares_replies`；GreenMail 测试 `sends_and_saves_drafts`（明文 SMTP 发信：EHLO、无 Bcc 头；存草稿后同步看得到，带 Bcc、已读）；界面用测试库截图核对全部回复和转发的预填与焦点、改过后关闭时的提示、丢弃、展开抄送密送、换发件账号、接着写草稿、账号设置的新栏位及保存。
    - 现状：以上验证通过。真实邮箱的发信（TLS、代理）、存已发送、存草稿和删旧草稿由用户实测。

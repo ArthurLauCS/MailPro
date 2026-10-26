@@ -126,7 +126,8 @@ fn sends_and_saves_drafts() {
         let acc = Account { email: "u@localhost".into(), name: "U".into(), host: "127.0.0.1".into(), port: 3143, ..Default::default() };
         let m = Mail { to: "U <u@localhost>".into(), bcc: "hidden@localhost".into(), subject: "测试 发信".into(), body: "第一行\n第二行".into(), ..Default::default() };
         let b = smtp::build(&acc, &m).unwrap();
-        smtp::deliver(TcpStream::connect(&smtp_addr).await.unwrap(), "u", "p", &b).await.unwrap();
+        let mut c = smtp::connect(TcpStream::connect(&smtp_addr).await.unwrap()).await.unwrap();
+        smtp::deliver(&mut c, "u", "p", false, &b).await.unwrap();
 
         // 收到的这封：EHLO 报 [127.0.0.1]，没有 Bcc 头
         let mut s = imap::login(TcpStream::connect(&imap_addr).await.unwrap(), "u", "p").await.unwrap();

@@ -1,6 +1,7 @@
 //! IMAP 同步：把文件夹和邮件头拉进本地缓存，写回本地的标记改动，在收件箱上 IDLE 等新变化；移动、删除邮件，
 //! 存草稿和已发送。
 
+use crate::auth::{Expired, Secret};
 use crate::store::{self, Account, Folder, Header, Store};
 use async_imap::imap_proto::{BodyStructure, NameAttribute};
 use async_imap::types::{Fetch, Flag, Name};
@@ -50,12 +51,16 @@ pub enum Event<'a> {
     Changed(&'a Folder, Changes),
     /// 连接断了，稍后重连
     Error(String),
+    /// Outlook 的授权失效（令牌端点拒了刷新令牌），不再重连，要重新登录
+    Expired(String),
 }
 
-pub async fn connect(acc: &Account, secret: &str) -> Result<Session> {
+/// 连上收信服务器登录：密码账号用 LOGIN，Outlook 先拿到访问令牌（可能要经代理换新的）再 XOAUTH2
+pub async fn connect(acc: &Account, secret: &Secret) -> Result<Session> {
+    let pass = secret.get(&acc.email, acc.proxy.as_deref()).await?;
     let tcp = tcp(acc.proxy.as_deref(), &acc.host, acc.port).await?;
     let tls = TlsConnector::from(native_tls::TlsConnector::new()?).connect(&acc.host, tcp).await?;
-    login(tls, &acc.email, secret).await
+    if secret.is_oauth() { xoauth2(tls, &acc.email, &pass).await } else { login(tls, &acc.email, &pass).await }
 }
 
 /// 本程序的对外连接都从这里出：设了代理就只经代理连，域名交给代理解析，本机不查 DNS；
@@ -71,6 +76,24 @@ pub async fn login<T: Io>(stream: T, user: &str, secret: &str) -> Result<Session
     let mut client = async_imap::Client::new(stream);
     client.read_response().await?; // 服务器问候语
     Ok(client.login(user, secret).await.map_err(|(e, _)| e)?)
+}
+
+/// 用 OAuth 访问令牌登录（SASL XOAUTH2）
+pub async fn xoauth2<T: Io>(stream: T, user: &str, token: &str) -> Result<Session<T>> {
+    let mut client = async_imap::Client::new(stream);
+    client.read_response().await?; // 服务器问候语
+    let sasl = XOAuth2(Some(format!("user={user}\x01auth=Bearer {token}\x01\x01")));
+    Ok(client.authenticate("XOAUTH2", sasl).await.map_err(|(e, _)| e)?)
+}
+
+/// 头一次回令牌；被拒时有的服务器再发一段错误说明，回空行收尾，服务器随即报失败
+struct XOAuth2(Option<String>);
+
+impl async_imap::Authenticator for XOAuth2 {
+    type Response = String;
+    fn process(&mut self, _: &[u8]) -> String {
+        self.0.take().unwrap_or_default()
+    }
 }
 
 /// 同步账号下全部文件夹：先按服务器增删文件夹，再逐个同步
@@ -206,8 +229,8 @@ pub async fn fetch_body<T: Io>(s: &mut Session<T>, db: &Store, f: &Folder, uid: 
 }
 
 /// 一直保持同步：每 [`POLL`] 同步全部文件夹，其间在收件箱上 IDLE，收件箱一有变化立即同步。
-/// 断线后等 [`RETRY_MIN`] 起翻倍、封顶 [`RETRY_MAX`] 再重连，一直重试。
-pub async fn watch(db: &Store, acc: &Account, secret: &str, mut on: impl FnMut(Event)) {
+/// 断线后等 [`RETRY_MIN`] 起翻倍、封顶 [`RETRY_MAX`] 再重连，一直重试；只有 Outlook 授权失效时停下。
+pub async fn watch(db: &Store, acc: &Account, secret: &Secret, mut on: impl FnMut(Event)) {
     let mut delay = RETRY_MIN;
     loop {
         let err = match connect(acc, secret).await {
@@ -218,6 +241,10 @@ pub async fn watch(db: &Store, acc: &Account, secret: &str, mut on: impl FnMut(E
             }
             Err(e) => e,
         };
+        // 重连也换不到令牌，等用户重新登录
+        if err.is::<Expired>() {
+            return on(Event::Expired(err.to_string()));
+        }
         on(Event::Error(err.to_string()));
         sleep(delay).await;
         delay = (delay * 2).min(RETRY_MAX);
@@ -324,12 +351,16 @@ fn domain(email: &str) -> String {
     email.rsplit('@').next().unwrap_or_default().to_ascii_lowercase()
 }
 
-/// Gmail 自动填 imap.gmail.com，其他邮箱返回 None，要手填
-pub fn default_host(email: &str) -> Option<&'static str> {
-    ["gmail.com", "googlemail.com"].contains(&domain(email).as_str()).then_some("imap.gmail.com")
+/// Gmail、Outlook 的服务器是固定的：(收信服务器, 发信服务器, 发信端口)，收信端口都是 993；
+/// 其他邮箱返回 None，要手填
+pub fn preset(email: &str) -> Option<(&'static str, &'static str, u16)> {
+    if ["gmail.com", "googlemail.com"].contains(&domain(email).as_str()) {
+        return Some(("imap.gmail.com", "smtp.gmail.com", 465));
+    }
+    oauth_only(email).then_some(("outlook.office365.com", "smtp-mail.outlook.com", 587))
 }
 
-/// Outlook / Hotmail 只收 OAuth 登录，暂不支持
+/// Outlook / Hotmail 只收 OAuth 登录（XOAUTH2），在浏览器里授权，见 [`crate::auth`]
 pub fn oauth_only(email: &str) -> bool {
     let d = domain(email);
     ["outlook.", "hotmail.", "live.", "msn."].iter().any(|p| d.starts_with(p))
@@ -385,6 +416,44 @@ mod tests {
         assert_eq!(folder_name("INBOX"), "INBOX");
         assert_eq!(folder_name("[Gmail]/&XfJT0ZCuTvY-"), "[Gmail]/已发邮件");
         assert_eq!(folder_name("&XfJT0ZAB-/a&-b"), "已发送/a&b");
+    }
+
+    #[test]
+    fn xoauth2_login() {
+        use base64::Engine;
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(async {
+            // 假服务器：第一次收下令牌；第二次像 Gmail 那样先发一段错误说明，等客户端回空行再报失败
+            for ok in [true, false] {
+                let (client, server) = tokio::io::duplex(4096);
+                let fake = async move {
+                    let mut s = BufReader::new(server);
+                    let mut line = String::new();
+                    s.write_all(b"* OK ready\r\n").await.unwrap();
+                    s.read_line(&mut line).await.unwrap();
+                    let tag = line.split(' ').next().unwrap().to_string();
+                    assert_eq!(&line[tag.len()..], " AUTHENTICATE XOAUTH2\r\n");
+                    s.write_all(b"+ \r\n").await.unwrap();
+                    line.clear();
+                    s.read_line(&mut line).await.unwrap();
+                    let sasl = base64::engine::general_purpose::STANDARD.decode(line.trim_end()).unwrap();
+                    assert_eq!(sasl, b"user=a@outlook.com\x01auth=Bearer tok\x01\x01");
+                    if !ok {
+                        s.write_all(b"+ eyJzdGF0dXMiOiI0MDAifQ==\r\n").await.unwrap();
+                        line.clear();
+                        s.read_line(&mut line).await.unwrap();
+                        assert_eq!(line, "\r\n");
+                    }
+                    let reply = if ok { "OK AUTHENTICATE completed." } else { "NO AUTHENTICATE failed." };
+                    s.write_all(format!("{tag} {reply}\r\n").as_bytes()).await.unwrap();
+                };
+                let (r, ()) = futures::join!(xoauth2(client, "a@outlook.com", "tok"), fake);
+                assert_eq!(r.is_ok(), ok);
+            }
+        });
+        assert_eq!(preset("a@Hotmail.com"), Some(("outlook.office365.com", "smtp-mail.outlook.com", 587)));
+        assert_eq!(preset("a@x.com"), None);
     }
 
     #[test]

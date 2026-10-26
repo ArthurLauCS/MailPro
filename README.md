@@ -14,7 +14,7 @@ A privacy-focused desktop mail client for Windows, written in Rust with a native
 4. **A proxy per account.** SOCKS5 `host:port`; host names are resolved by the proxy, so no mail server name reaches your DNS. If the proxy is down, the connection fails instead of going direct. Accounts without a proxy are marked "Direct" in their settings.
 5. **Safe links.** Clicking a link shows the cleaned address first: known redirect wrappers (Google, Outlook SafeLinks, Facebook and others) are unwrapped and tracking parameters removed, with the original address listed next to it. Open it in the system browser, a program you choose, or an [AdsPower](https://www.adspower.com/) profile, which is started through AdsPower's local API so its fingerprint and proxy apply.
 6. **Sending that reveals less.** Plain-text mail goes out over TLS through the account's proxy. The SMTP greeting names `[127.0.0.1]` instead of your computer, the Date header is in UTC so it doesn't give away your time zone, the Message-ID carries no host name, and no mail program name is sent.
-7. **Gmail and other IMAP accounts.** Gmail signs in with an app password; other providers with a manually entered IMAP server over TLS. Read status lives on the server, so several computers stay in sync: marking a message read is written back within seconds, and changes made elsewhere reach the inbox within seconds (IDLE) and other folders within five minutes.
+7. **Gmail, Outlook and other IMAP accounts.** Gmail signs in with an app password; Outlook / Hotmail through Microsoft's sign-in page in your browser (OAuth, no password stored); other providers with a manually entered IMAP server over TLS. Read status lives on the server, so several computers stay in sync: marking a message read is written back within seconds, and changes made elsewhere reach the inbox within seconds (IDLE) and other folders within five minutes.
 8. **Fast with large folders.** Headers of every folder are synced in full and kept in a local SQLite database; bodies are downloaded when opened. A folder of 50,000 messages scrolls at a median frame time of 2.8 ms.
 9. **No telemetry, no crash reporting.** English and Simplified Chinese; light and dark themes follow the system, and dark mode darkens message bodies too.
 
@@ -30,11 +30,11 @@ Run `MailPro-Setup-0.1.0.exe` from [GitHub Releases](https://github.com/ArthurLa
 - The installer offers English and Simplified Chinese; the app's language is chosen separately in the app.
 - The installer is unsigned, so Windows SmartScreen may warn about an unknown publisher: choose **More info → Run anyway**. Check the file against `SHA256SUMS.txt` with `Get-FileHash .\MailPro-Setup-0.1.0.exe -Algorithm SHA256`.
 
-Mail and settings are stored in `%LOCALAPPDATA%\MailPro`; passwords are stored in Windows Credential Manager. Uninstalling removes both.
+Mail and settings are stored in `%LOCALAPPDATA%\MailPro`; passwords and Outlook sign-in tokens are stored in Windows Credential Manager. Uninstalling removes both.
 
 ## Usage
 
-1. **Add account** (bottom of the left column): enter the address, an app password and, recommended, a SOCKS5 proxy such as `127.0.0.1:7890`. For Gmail, turn on 2-Step Verification and create an app password at [myaccount.google.com/apppasswords](https://myaccount.google.com/apppasswords). For other providers, also enter the IMAP server and port (TLS only) and the SMTP server and port (SSL/TLS, usually port 465; STARTTLS isn't supported). Left empty, the SMTP server is the IMAP server with `imap.` replaced by `smtp.`.
+1. **Add account** (bottom of the left column): enter the address, an app password and, recommended, a SOCKS5 proxy such as `127.0.0.1:7890`. For Gmail, turn on 2-Step Verification and create an app password at [myaccount.google.com/apppasswords](https://myaccount.google.com/apppasswords). For Outlook / Hotmail, first turn on IMAP in Outlook on the web (Settings → Mail → Forwarding and IMAP); then enter the address and proxy and click **Sign in**: Microsoft's sign-in page opens in the browser chosen under **Browser** (item 3), so it uses that browser's network; choose the same account and allow access. Each Outlook mailbox signs in on its own. If access is later revoked or expires, the account shows a notice; click **Sign in again** in its settings. For other providers, also enter the IMAP server and port (TLS only) and the SMTP server and port (port 587 uses STARTTLS, other ports SSL/TLS, usually 465). Left empty, the SMTP server is the IMAP server with `imap.` replaced by `smtp.`.
 2. Opening a message marks it read on the server. The reader header lists the blocked remote content; **Load images** loads it for this message, **Always load images from this sender** for every message from that address.
 3. **Browser** (bottom of the left column) chooses where links open. For AdsPower, enter the profile ID and the API key from AdsPower's API settings; the key is kept in Credential Manager.
 4. Drag an account row onto another account to reorder them. An account row glows softly while its inbox has mail received in the last 30 minutes.
@@ -44,7 +44,7 @@ Mail and settings are stored in `%LOCALAPPDATA%\MailPro`; passwords are stored i
 
 ## Current limits
 
-Not yet available: attachments and formatted text when writing, Outlook / Hotmail accounts (their IMAP requires OAuth), desktop notifications, and import / export of settings.
+Not yet available: attachments and formatted text when writing, desktop notifications, and import / export of settings. Outlook / Hotmail supports personal Microsoft accounts only, not work or school accounts.
 
 ## Development
 

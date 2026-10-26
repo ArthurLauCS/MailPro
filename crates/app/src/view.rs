@@ -55,6 +55,8 @@ struct Acct {
     latest: i64,
     /// 连接断开的原因，重新连上后清掉
     error: Option<String>,
+    /// Outlook 授权失效，停止同步，要重新登录；error 同时置上
+    expired: bool,
 }
 
 /// 拖动中的账号，跟着鼠标画一个强调色的小条
@@ -311,9 +313,9 @@ impl MailPro {
         let mut accounts = self.db.accounts().unwrap_or_default();
         accounts.sort_by_key(|a| order.iter().position(|&id| id == a.id).unwrap_or(usize::MAX));
         for acc in accounts {
-            let error = old.iter().find(|a| a.acc.id == acc.id).and_then(|a| a.error.clone());
+            let (error, expired) = old.iter().find(|a| a.acc.id == acc.id).map_or((None, false), |a| (a.error.clone(), a.expired));
             let id = acc.id;
-            self.accounts.push(Acct { acc, folders: Vec::new(), latest: 0, error });
+            self.accounts.push(Acct { acc, folders: Vec::new(), latest: 0, error, expired });
             self.reload_folders(id);
         }
     }
@@ -609,7 +611,7 @@ impl MailPro {
         match e {
             Event::Folders(account) => {
                 if let Some(a) = self.accounts.iter_mut().find(|a| a.acc.id == account) {
-                    a.error = None;
+                    (a.error, a.expired) = (None, false);
                 }
                 self.reload_folders(account);
                 self.select_first(Some(account), cx);
@@ -642,6 +644,12 @@ impl MailPro {
                 Some(a) => a.error = Some(msg),
                 None => eprintln!("{msg}"),
             },
+            Event::Expired(account) => {
+                if let Some(a) = self.accounts.iter_mut().find(|a| a.acc.id == account) {
+                    (a.error, a.expired) = (Some(String::new()), true);
+                }
+            }
+            Event::Browse(url) => self.browse(url, cx),
             Event::Added(Ok(account)) => {
                 self.reload_accounts();
                 if self.form.take().is_some() && window.has_active_dialog(cx) {
@@ -790,7 +798,8 @@ impl MailPro {
         window.open_dialog(cx, move |dialog, _, cx| form_dialog(&form, &view, dialog, cx));
     }
 
-    fn submit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    /// 添加账号，或保存账号设置；`relogin` 是 Outlook 账号设置里的重新登录，登录通过才连同设置一起存
+    fn submit(&mut self, relogin: bool, window: &mut Window, cx: &mut Context<Self>) {
         let Some(form) = self.form.clone() else { return };
         let t = t(cx);
         let f = form.read(cx);
@@ -803,26 +812,56 @@ impl MailPro {
         let smtp_host = |host: &str| if smtp_host.is_empty() { smtp::default_host(host) } else { smtp_host.clone() };
         if let Some(acc) = f.account.clone() {
             // 账号设置改代理、发信名字和发信服务器，按新设置重连
-            let smtp_host = smtp_host(&acc.host);
-            let _ = self.db.add_account(&Account { proxy, name, smtp_host, smtp_port, ..acc });
-            let _ = self.cmd.unbounded_send(Cmd::Restart(acc.id));
-            self.reload_accounts();
-            self.form = None;
-            window.close_dialog(cx);
-            return;
+            let acc = Account { proxy, name, smtp_host: smtp_host(&acc.host), smtp_port, ..acc };
+            if !relogin {
+                let _ = self.db.add_account(&acc);
+                let _ = self.cmd.unbounded_send(Cmd::Restart(acc.id));
+                self.reload_accounts();
+                self.form = None;
+                window.close_dialog(cx);
+                return;
+            }
+            let _ = self.cmd.unbounded_send(Cmd::Add(acc, String::new()));
+            return form.update(cx, |f, cx| {
+                (f.busy, f.error) = (true, None);
+                cx.notify();
+            });
         }
-        let host = imap::default_host(&email).map(str::to_string).or(Some(host).filter(|h| !h.is_empty()));
-        let error = match &host {
-            _ if imap::oauth_only(&email) => Some(t.oauth_only),
-            None => Some(t.need_server),
-            Some(_) => None,
-        };
-        if let (None, Some(host)) = (error, host) {
-            let acc = Account { id: 0, email, smtp_host: smtp_host(&host), smtp_port, host, port: port.parse().unwrap_or(993), proxy, name };
+        // Gmail、Outlook 的收信、发信服务器都是固定的
+        let preset = imap::preset(&email);
+        let host = preset.map(|p| p.0.to_string()).or(Some(host).filter(|h| !h.is_empty()));
+        let error = host.is_none().then_some(t.need_server);
+        if let Some(host) = host {
+            let (smtp_host, smtp_port) = preset.map_or_else(|| (smtp_host(&host), smtp_port), |p| (p.1.into(), p.2));
+            let acc = Account { id: 0, email, smtp_host, smtp_port, host, port: port.parse().unwrap_or(993), proxy, name };
             let _ = self.cmd.unbounded_send(Cmd::Add(acc, secret));
         }
         form.update(cx, |f, cx| {
             (f.busy, f.error) = (error.is_none(), error.map(Into::into));
+            cx.notify();
+        });
+    }
+
+    /// Outlook 登录：按“浏览器”菜单打开授权地址，登录页的网络即该浏览器（AdsPower 环境）的网络
+    fn browse(&mut self, url: String, cx: &mut Context<Self>) {
+        let Some(id) = browser::adspower(&self.browser).map(str::to_string) else {
+            return self.browse_failed(browser::open(&url, &self.browser), cx);
+        };
+        // AdsPower 可能要先启动环境，放到后台等
+        let task = cx.background_spawn(async move { browser::open_adspower(&url, &id) });
+        cx.spawn(async move |this, cx| {
+            let r = task.await;
+            let _ = this.update(cx, |v, cx| v.browse_failed(r, cx));
+        })
+        .detach();
+    }
+
+    /// 浏览器打不开就放弃这次登录，原因显示在对话框里
+    fn browse_failed(&mut self, r: Result<(), String>, cx: &mut Context<Self>) {
+        let (Err(e), Some(form)) = (r, &self.form) else { return };
+        let _ = self.cmd.unbounded_send(Cmd::Cancel);
+        form.update(cx, |f, cx| {
+            (f.busy, f.error) = (false, Some(format!("{}{e}", t(cx).open_failed)));
             cx.notify();
         });
     }
@@ -908,7 +947,8 @@ impl MailPro {
                 .on_drop(cx.listener(move |v, d: &DraggedAccount, _, cx| v.move_account(d.id, id, cx)))
                 .child(head)
                 .when(!collapsed, |d| {
-                    d.when_some(a.error.clone(), |d, e| d.child(div().pl(px(30.)).pr_2().text_xs().text_color(theme.danger).child(format!("{}{e}", t.disconnected))))
+                    let error = a.error.as_ref().map(|e| if a.expired { t.expired.to_string() } else { format!("{}{e}", t.disconnected) });
+                    d.when_some(error, |d, e| d.child(div().pl(px(30.)).pr_2().text_xs().text_color(theme.danger).child(e)))
                         .children(folders)
                 })
         });
@@ -1392,21 +1432,34 @@ fn form_dialog(form: &Entity<Form>, view: &WeakEntity<MailPro>, dialog: Dialog, 
     let f = form.read(cx);
     let settings = f.account.is_some();
     let email = f.account.as_ref().map_or_else(|| f.email.read(cx).value(), |a| a.email.clone().into());
-    // Gmail 的收信、发信服务器都是固定的
-    let gmail = imap::default_host(&email).is_some();
-    let password = if gmail { t.app_password } else { t.password };
+    // Gmail、Outlook 的收信、发信服务器都是固定的；Outlook 不用密码，在浏览器里登录
+    let (preset, oauth) = (imap::preset(&email).is_some(), imap::oauth_only(&email));
+    let password = if preset { t.app_password } else { t.password };
     let direct = f.proxy.read(cx).value().trim().is_empty();
     let field = |label: &'static str, input: &Entity<InputState>| v_flex().gap_1().child(div().text_sm().child(label)).child(Input::new(input));
-    let view = view.clone();
+    let busy = |label| if !f.busy { label } else if oauth { t.waiting_browser } else { t.signing_in };
+    let submit = |relogin| {
+        let view = view.clone();
+        move |_: &ClickEvent, window: &mut Window, cx: &mut App| drop(view.update(cx, |v, cx| v.submit(relogin, window, cx)))
+    };
+    // 关掉对话框即放弃正在进行的 Outlook 浏览器登录，回环监听随之关闭
+    let cancel = {
+        let view = view.clone();
+        move |cx: &mut App| drop(view.update(cx, |v, _| drop(v.cmd.unbounded_send(Cmd::Cancel))))
+    };
+    let on_close = cancel.clone();
     dialog
         .title(title(if settings { t.account_settings } else { t.add_account }))
         .w(px(440.))
+        .on_close(move |_, _, cx| on_close(cx))
         .child(
             v_flex()
                 .gap_3()
-                .when(!settings, |d| d.child(field(t.email, &f.email)).child(field(password, &f.secret)))
-                .when(!settings && !gmail, |d| d.child(h_flex().gap_2().child(field(t.server, &f.host).flex_1()).child(field(t.port, &f.port).w(px(90.)))))
-                .when(!gmail, |d| d.child(h_flex().gap_2().child(field(t.smtp_server, &f.smtp_host).flex_1()).child(field(t.port, &f.smtp_port).w(px(90.)))))
+                .when(!settings, |d| d.child(field(t.email, &f.email)))
+                .when(!settings && oauth, |d| d.child(div().font_family(PROSE).text_sm().text_color(theme.muted_foreground).child(t.outlook_hint)))
+                .when(!settings && !oauth, |d| d.child(field(password, &f.secret)))
+                .when(!settings && !preset, |d| d.child(h_flex().gap_2().child(field(t.server, &f.host).flex_1()).child(field(t.port, &f.port).w(px(90.)))))
+                .when(!preset, |d| d.child(h_flex().gap_2().child(field(t.smtp_server, &f.smtp_host).flex_1()).child(field(t.port, &f.smtp_port).w(px(90.)))))
                 .child(field(t.sender_name, &f.name))
                 .child(field(t.proxy, &f.proxy))
                 .when(direct, |d| d.child(div().font_family(PROSE).text_sm().text_color(theme.warning).child(t.direct_warning)))
@@ -1416,15 +1469,17 @@ fn form_dialog(form: &Entity<Form>, view: &WeakEntity<MailPro>, dialog: Dialog, 
             h_flex()
                 .justify_end()
                 .gap_2()
-                .child(Button::new("cancel").label(t.cancel).on_click(|_, window, cx| window.close_dialog(cx)))
+                .child(Button::new("cancel").label(t.cancel).on_click(move |_, window, cx| {
+                    cancel(cx);
+                    window.close_dialog(cx)
+                }))
+                .when(settings && oauth, |d| d.child(Button::new("relogin").label(busy(t.relogin)).disabled(f.busy).on_click(submit(true))))
                 .child(
                     Button::new("ok")
                         .primary()
-                        .label(if f.busy { t.signing_in } else if settings { t.save } else { t.add })
+                        .label(if settings { t.save } else { busy(if oauth { t.sign_in } else { t.add }) })
                         .disabled(f.busy)
-                        .on_click(move |_, window, cx| {
-                            let _ = view.update(cx, |v, cx| v.submit(window, cx));
-                        }),
+                        .on_click(submit(false)),
                 ),
         )
 }

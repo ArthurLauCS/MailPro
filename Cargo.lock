@@ -3317,11 +3317,13 @@ dependencies = [
  "httpdate",
  "idna",
  "mime",
+ "native-tls",
  "nom",
  "percent-encoding",
  "quoted_printable",
  "socket2",
  "tokio",
+ "tokio-native-tls",
  "url",
 ]
 
@@ -3573,6 +3575,7 @@ version = "0.1.0"
 dependencies = [
  "ammonia",
  "async-imap",
+ "base64 0.23.1",
  "chrono",
  "fastrand",
  "futures",
@@ -3581,6 +3584,7 @@ dependencies = [
  "percent-encoding",
  "regex",
  "rusqlite",
+ "serde_json",
  "tokio",
  "tokio-native-tls",
  "tokio-socks",
