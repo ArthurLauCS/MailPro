@@ -24,13 +24,14 @@ use gpui_component::menu::{ContextMenuExt, DropdownMenu, PopupMenuItem};
 use gpui_component::notification::Notification;
 use gpui_component::resizable::{h_resizable, resizable_panel};
 use gpui_component::scroll::ScrollableElement;
+use gpui_component::theme::Theme;
 use gpui_component::{ActiveTheme, Disableable, Icon, Sizable, WindowExt, h_flex, v_flex};
 use gpui_kit_assets::IconName;
 use mailpro_core::cred;
 use mailpro_core::engine::{self, BodyError, Cmd, Event};
 use mailpro_core::imap::{self, folder_name};
 use mailpro_core::link::{self, Link};
-use mailpro_core::message::Message;
+use mailpro_core::message::{self, Message};
 use mailpro_core::smtp::{self, Mail};
 use mailpro_core::store::{self, Account, Folder, Header, Store};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
@@ -205,8 +206,10 @@ pub struct MailPro {
     /// 等到最早一个账号该熄灭泛光时重画
     glow: Task<()>,
     tray: tray::Tray,
-    /// 收件箱 id →（这时刻起收到的才弹新信通知，已经看过的最大 uid），见 [`MailPro::notify_new`]
+    /// 文件夹 id →（第一次读到它的时刻，那时最大的 uid）：此后收到的才算新信，收件箱的弹通知，未读时列表里标“新”
     fresh: HashMap<i64, (i64, u32)>,
+    /// 收件箱 id → 已经弹过通知的最大 uid，见 [`MailPro::notify_new`]
+    notified: HashMap<i64, u32>,
     /// 最近一条通知点开后去哪：（账号，收件箱，只有一封时它的 uid）
     notice: Option<(i64, i64, Option<u32>)>,
     /// 点通知要打开的那封（文件夹 id，uid），列表读好后打开
@@ -237,7 +240,7 @@ impl MailPro {
         })
         .detach();
         let (tx, mut rx) = futures::channel::mpsc::unbounded();
-        let tray = tray::Tray::new(&path, t(cx), tx);
+        let tray = tray::Tray::new(&path, hwnd(window), t(cx), tx);
         cx.spawn_in(window, async move |this, cx| {
             while let Some(e) = rx.next().await {
                 if this.update_in(cx, |v, window, cx| v.on_tray(e, window, cx)).is_err() {
@@ -251,6 +254,13 @@ impl MailPro {
             tray::hide(hwnd(window));
             false
         });
+        // 窗口到了前台就算看过新信，托盘图标去掉红点
+        cx.observe_window_activation(window, |v, window, _| {
+            if window.is_window_active() {
+                v.tray.alert(false);
+            }
+        })
+        .detach();
 
         let current = webview::Current::default();
         let reading = eml.map(|m| {
@@ -299,6 +309,7 @@ impl MailPro {
             glow: Task::ready(()),
             tray,
             fresh: HashMap::new(),
+            notified: HashMap::new(),
             notice: None,
             goto: None,
         };
@@ -352,9 +363,9 @@ impl MailPro {
         a.folders = folders.into_iter().map(|f| (db.stats(f.id).map_or(0, |s| s.1), f)).map(|(n, f)| (f, n)).collect();
         let inbox = a.folders.iter().find(|f| f.0.role.as_deref() == Some("inbox")).map(|f| f.0.id);
         a.latest = inbox.map_or(0, |id| db.latest(id).unwrap_or(0));
-        // 收件箱从第一次读到它起（启动时，或新加的账号列出文件夹时）收到的新信才弹通知
-        if let Some(id) = inbox {
-            self.fresh.entry(id).or_insert_with(|| (Local::now().timestamp(), db.max_uid(id).unwrap_or(0)));
+        // 从第一次读到文件夹起（启动时，或新加的账号列出文件夹时）收到的才算新信
+        for (f, _) in &a.folders {
+            self.fresh.entry(f.id).or_insert_with(|| (Local::now().timestamp(), db.max_uid(f.id).unwrap_or(0)));
         }
         let inboxes = self.accounts.iter().flat_map(|a| &a.folders).filter(|f| f.0.role.as_deref() == Some("inbox"));
         self.tray.unread(inboxes.map(|f| f.1).sum());
@@ -479,15 +490,15 @@ impl MailPro {
         h.folder == self.picked_in.1 && self.picked.contains(&h.uid)
     }
 
-    /// 打开一封：标已读，再取正文
+    /// 打开一封：取正文，再标已读（写回服务器排在取正文后面）
     fn open(&mut self, account: i64, folder: i64, uid: u32, cx: &mut Context<Self>) {
         let Some(f) = self.folder(account, folder) else { return };
-        self.mark((account, folder), store::SEEN, true, |h| h.uid == uid, cx);
         let Some(h) = self.headers.iter().find(|h| h.folder == folder && h.uid == uid) else { return };
         let from = if h.from_name.is_empty() { h.from_addr.clone() } else { h.from_name.clone() };
         let trusted = self.db.images_allowed(&h.from_addr).unwrap_or(false);
         self.reading = Some(Reading::new(account, folder, uid, h.date, h.subject.clone(), from, h.from_addr.clone(), trusted));
         let _ = self.cmd.unbounded_send(Cmd::Body { account, folder: f, uid });
+        self.mark((account, folder), store::SEEN, true, |h| h.uid == uid, cx);
         cx.notify();
     }
 
@@ -708,24 +719,34 @@ impl MailPro {
         cx.notify();
     }
 
-    /// 收件箱新到的未读信弹通知（只算 `fresh` 记的时刻起收到的），窗口在前台时不弹。
-    /// 一封显示发件人和主题，点开即打开它；多封合成一条，点开打开收件箱
+    /// 收件箱新到的未读信弹通知（只算 `fresh` 记的时刻起收到的），窗口在前台时不弹；弹了托盘图标就带红点，直到窗口回到前台。
+    /// 一封显示发件人、主题和正文开头（收信时已预取，太大的没有），点开即打开它；多封合成一条，每行一封的发件人和主题，点开打开收件箱
     fn notify_new(&mut self, account: i64, folder: i64, window: &Window, t: &T) {
-        let Some((since, after)) = self.fresh.get_mut(&folder) else { return };
-        let new = self.db.fresh(folder, *after, *since).unwrap_or_default();
+        if self.locate(folder).is_none_or(|(_, f)| f.role.as_deref() != Some("inbox")) {
+            return;
+        }
+        let Some(&(since, start)) = self.fresh.get(&folder) else { return };
+        let after = self.notified.entry(folder).or_insert(start);
+        let new = self.db.fresh(folder, *after, since).unwrap_or_default();
         let Some(top) = new.iter().map(|h| h.uid).max() else { return };
         *after = top;
         if window.is_window_active() {
             return;
         }
-        let Some(a) = self.accounts.iter().find(|a| a.acc.id == account) else { return };
+        let from = |h: &Header| if h.from_name.is_empty() { h.from_addr.clone() } else { h.from_name.clone() };
+        let subject = |h: &Header| if h.subject.is_empty() { t.no_subject.to_string() } else { h.subject.clone() };
         match &new[..] {
             [h] => {
-                let from = if h.from_name.is_empty() { &h.from_addr } else { &h.from_name };
-                self.tray.notify(from, if h.subject.is_empty() { t.no_subject } else { &h.subject });
+                let text = self.db.body(folder, h.uid).ok().flatten().and_then(|raw| message::original(&raw)).map(|m| m.text).unwrap_or_default();
+                let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+                self.tray.notify(&from(h), format!("{}\n{text}", subject(h)).trim_end());
             }
-            _ => self.tray.notify(&a.acc.email, &t.new_mail.replace("{n}", &new.len().to_string())),
+            _ => {
+                let lines: Vec<String> = new.iter().map(|h| format!("{}{}{}", from(h), t.colon, subject(h))).collect();
+                self.tray.notify(&t.new_mail.replace("{n}", &new.len().to_string()), &lines.join("\n"));
+            }
         }
+        self.tray.alert(true);
         self.notice = Some((account, folder, (new.len() == 1).then_some(top)));
     }
 
@@ -743,9 +764,13 @@ impl MailPro {
                 self.tray.remove();
                 return cx.quit();
             }
-            tray::Event::Readd => return self.tray.add(),
+            tray::Event::Readd => {
+                self.tray.add();
+                return self.tray.badge();
+            }
         }
         tray::show(hwnd(window));
+        self.tray.badge();
         window.activate_window();
     }
 
@@ -982,7 +1007,7 @@ impl MailPro {
                         .when(a.acc.proxy.is_none(), |d| d.child(div().text_xs().text_color(theme.warning).child(t.direct)))
                         // 收起时断线只亮红点，原因展开后看
                         .when(collapsed && a.error.is_some(), |d| d.child(div().size(px(7.)).flex_none().rounded_full().bg(theme.danger)))
-                        .when(collapsed && inbox > 0, |d| d.child(div().text_xs().text_color(theme.muted_foreground).child(inbox.to_string())))
+                        .when(collapsed && inbox > 0, |d| d.child(badge(inbox.to_string(), theme)))
                         .on_click(cx.listener(move |v, _, _, cx| v.toggle(id, cx))),
                 )
                 .child(
@@ -1010,7 +1035,7 @@ impl MailPro {
                     .when(!selected, |d| d.hover(|d| d.bg(theme.list_hover)))
                     .child(Icon::new(folder_icon(f)).small().text_color(if selected { theme.link } else { theme.muted_foreground }))
                     .child(div().flex_1().truncate().child(folder_label(t, f)))
-                    .when(*unread > 0, |d| d.child(div().text_xs().text_color(theme.muted_foreground).child(unread.to_string())))
+                    .when(*unread > 0, |d| d.child(badge(unread.to_string(), theme)))
                     // 点文件夹就不再搜索
                     .on_click(cx.listener(move |v, _, window, cx| {
                         v.query.update(cx, |q, cx| q.clean(window, cx));
@@ -1099,6 +1124,8 @@ impl MailPro {
         let h = &self.headers[i];
         let (folder, uid) = (h.folder, h.uid);
         let unread = h.flags & store::SEEN == 0;
+        // 程序开着期间新到、还没读的
+        let new = unread && self.fresh.get(&folder).is_some_and(|&(since, after)| h.uid > after && h.date >= since);
         let picked = self.is_picked(h);
         let from = if h.from_name.is_empty() { &h.from_addr } else { &h.from_name };
         let view = cx.entity().downgrade();
@@ -1120,12 +1147,13 @@ impl MailPro {
             .border_color(theme.border)
             .cursor_pointer()
             .when(picked, |d| d.bg(theme.list_active).child(div().absolute().left_0().top_0().bottom_0().w(px(3.)).bg(theme.primary)))
-            .when(!picked, |d| d.hover(|d| d.bg(theme.list_hover)))
+            .when(!picked, |d| d.when(new, |d| d.bg(theme.primary.opacity(0.1))).hover(|d| d.bg(theme.list_hover)))
             .child(
                 h_flex()
                     .gap_2()
                     .child(div().size(px(7.)).flex_none().rounded_full().when(unread, |d| d.bg(theme.primary)))
                     .child(div().flex_1().truncate().text_sm().when(unread, |d| d.font_weight(FontWeight::SEMIBOLD)).child(from.clone()))
+                    .when(new, |d| d.child(badge(t.new_tag, theme)))
                     .child(div().flex_none().text_xs().text_color(theme.muted_foreground).child(short_date(t, h.date))),
             )
             .child(
@@ -1636,6 +1664,11 @@ fn avatar(id: i64, email: &str) -> impl IntoElement {
         .font_weight(FontWeight::BOLD)
         .text_color(white())
         .child(email.chars().next().unwrap_or('?').to_uppercase().to_string())
+}
+
+/// 强调色底白字的小圆角标：未读数、新信的“新”
+fn badge(s: impl Into<SharedString>, theme: &Theme) -> impl IntoElement {
+    div().flex_none().px_1p5().rounded_full().bg(theme.primary).text_color(theme.primary_foreground).text_xs().font_weight(FontWeight::SEMIBOLD).child(s.into())
 }
 
 /// 按 `role` 取图标，Gmail 标签等自建文件夹用普通文件夹图标

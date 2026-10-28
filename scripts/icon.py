@@ -1,6 +1,7 @@
 """由 crates/app/assets/icon.svg（40px 及以上）和 icon-small.svg（16～32px）生成应用图标。
 
-产物在 crates/app/assets：app.ico（安装包图标）、app.res（build.rs 链接进 exe）；预览图在 target/icon-preview.png。
+产物在 crates/app/assets：app.ico（安装包图标）、app.res（build.rs 链接进 exe，另含有新信没看时托盘用的红点图标）；
+预览图在 target/icon-preview.png。
 用无头 Chrome 按每个尺寸单独栅格化（小图标不是大图缩小，线条才清楚），Pillow 裁切，rc.exe 编资源。
 改了 SVG 后运行：python scripts/icon.py
 """
@@ -19,12 +20,16 @@ CHROME = r"C:\Program Files\Google\Chrome\Application\chrome.exe"
 SIZES = [16, 20, 24, 32, 40, 48, 64, 128, 256]
 
 
-def render() -> dict[int, Image.Image]:
-    # 所有尺寸横排在一页里截一次图，再按位置裁出来
+def render(dot: bool) -> dict[int, Image.Image]:
+    # 所有尺寸横排在一页里截一次图，再按位置裁出来；`dot` 时右上角加白边红点
     x, cells = 0, []
     for s in SIZES:
         svg = (ASSETS / ("icon-small.svg" if s <= 32 else "icon.svg")).as_uri()
         cells.append(f'<img src="{svg}" style="position:absolute;left:{x}px;top:0;width:{s}px;height:{s}px">')
+        if dot:
+            d, ring = s * 0.5, max(1, round(s / 16))
+            cells.append(f'<div style="position:absolute;left:{x + s - d}px;top:0;width:{d}px;height:{d}px;box-sizing:border-box;'
+                         f'border-radius:50%;background:#FF2D20;border:{ring}px solid #fff"></div>')
         x += s + 8
     with tempfile.TemporaryDirectory() as tmp:
         page, shot = Path(tmp) / "sheet.html", Path(tmp) / "sheet.png"
@@ -57,24 +62,27 @@ def write_ico(images: dict[int, Image.Image], path: Path):
 
 
 def main():
-    images = render()
+    images, dotted = render(False), render(True)
     write_ico(images, ASSETS / "app.ico")
-    # 预览：浅色、深色底各一行，检查边缘和小尺寸的清晰度
-    w = sum(s + 16 for s in SIZES)
-    prev = Image.new("RGBA", (w, 2 * (max(SIZES) + 16)), "#F4F2EA")
-    prev.paste("#1F1E1D", (0, max(SIZES) + 16, w, prev.height))
+    write_ico(dotted, ASSETS / "dot.ico")
+    # 预览：两种图标在浅色、深色底各一行，检查边缘和小尺寸的清晰度
+    w, h = sum(s + 16 for s in SIZES), max(SIZES) + 16
+    prev = Image.new("RGBA", (w, 4 * h), "#F4F2EA")
+    prev.paste("#1F1E1D", (0, h, w, 2 * h))
+    prev.paste("#1F1E1D", (0, 3 * h, w, 4 * h))
     x = 8
     for s in SIZES:
-        for row in range(2):
-            prev.alpha_composite(images[s], (x, 8 + row * (max(SIZES) + 16)))
+        for row in range(4):
+            prev.alpha_composite((images, dotted)[row // 2][s], (x, 8 + row * h))
         x += s + 16
     (ROOT / "target").mkdir(exist_ok=True)
     prev.save(ROOT / "target" / "icon-preview.png")
-    # 资源号 1：资源管理器和 gpui 的窗口图标都取 exe 里编号为 1 的图标组
+    # 资源号 1：资源管理器和 gpui 的窗口图标都取 exe 里编号为 1 的图标组；2：托盘的红点图标
     rc = sorted(glob.glob(r"C:\Program Files (x86)\Windows Kits\10\bin\*\x64\rc.exe"))[-1]
-    (ASSETS / "app.rc").write_text('1 ICON "app.ico"\n', encoding="ascii")
+    (ASSETS / "app.rc").write_text('1 ICON "app.ico"\n2 ICON "dot.ico"\n', encoding="ascii")
     subprocess.run([rc, "/nologo", "/fo", "app.res", "app.rc"], cwd=ASSETS, check=True)
     (ASSETS / "app.rc").unlink()
+    (ASSETS / "dot.ico").unlink()
 
 
 if __name__ == "__main__":
