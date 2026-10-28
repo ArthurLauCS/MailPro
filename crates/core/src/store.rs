@@ -251,6 +251,12 @@ impl Store {
         self.0.query_row("SELECT COALESCE(MAX(uid), 0) FROM message WHERE folder = ?1", [folder], |r| r.get(0))
     }
 
+    /// uid 大于 `after`、不超过 `size` 字节的邮件（新信预取正文用）
+    pub fn small(&self, folder: i64, after: u32, size: u32) -> Result<Vec<u32>> {
+        let mut st = self.0.prepare("SELECT uid FROM message WHERE folder = ?1 AND uid > ?2 AND size <= ?3")?;
+        st.query_map(params![folder, after, size], |r| r.get(0))?.collect()
+    }
+
     /// (总数, 未读数)
     pub fn stats(&self, folder: i64) -> Result<(u32, u32)> {
         self.0.query_row(
