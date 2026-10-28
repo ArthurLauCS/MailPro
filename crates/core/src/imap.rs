@@ -5,7 +5,7 @@ use crate::auth::{Expired, Secret};
 use crate::store::{self, Account, Folder, Header, Store};
 use async_imap::extensions::idle::IdleResponse;
 use async_imap::imap_proto::{BodyStructure, NameAttribute};
-use async_imap::types::{Fetch, Flag, Name};
+use async_imap::types::{Fetch, Flag, Name, UnsolicitedResponse};
 use futures::TryStreamExt;
 use mail_parser::MessageParser;
 use std::convert::Infallible;
@@ -26,13 +26,15 @@ pub type Session<T = TlsStream<TcpStream>> = async_imap::Session<T>;
 
 /// 全部文件夹多久同步一次；收件箱另靠 IDLE 实时
 const POLL: Duration = Duration::from_secs(5 * 60);
-/// IDLE 多久没动静就结束再重新发起：有的代理掐断空闲约 60 秒的连接（实测 Clash 上游的 ISP SOCKS5）
-const KEEP: Duration = Duration::from_secs(25);
-/// 断线重连等待：从 5 秒起每次翻倍，封顶 5 分钟
+/// 连接最多闲多久：IDLE 到时结束再重新发起，取正文的连接发 NOOP。有的代理掐断空闲约 60 秒的连接（实测 Clash 上游的 ISP SOCKS5）
+pub const KEEP: Duration = Duration::from_secs(25);
+/// 断线重连等待：从 5 秒起每次翻倍，封顶 1 分钟
 const RETRY_MIN: Duration = Duration::from_secs(5);
-const RETRY_MAX: Duration = Duration::from_secs(5 * 60);
+const RETRY_MAX: Duration = Duration::from_secs(60);
 /// 一条命令最多带的 UID 数，免得命令行过长
 const BATCH: usize = 500;
+/// 收件箱新到的信不超过这么大（RFC822.SIZE）就顺带取正文，再大的多半带附件，点开时再取
+const PREFETCH: u32 = 2 * 1024 * 1024;
 const HEAD: &str = "(UID FLAGS INTERNALDATE RFC822.SIZE BODYSTRUCTURE BODY.PEEK[HEADER.FIELDS (FROM SUBJECT)])";
 
 #[derive(Debug, Default, PartialEq)]
@@ -120,7 +122,7 @@ pub async fn sync_all<T: Io>(s: &mut Session<T>, db: &Store, acc: &Account, on: 
 
 /// 同步一个文件夹，结束时它处于选中状态：
 /// 1. 写回本地待写回的标记改动；
-/// 2. 拉 UID 比本地大的新邮件；
+/// 2. 拉 UID 比本地大的新邮件，是收件箱就连不超过 [`PREFETCH`] 的正文一起取：点开即显示，新信通知也能带正文开头；
 /// 3. 首次同步未完成或封数对不上时和服务器对账：删掉服务器已删的，从新到旧分批补拉缺的；
 /// 4. 更新已有邮件的标记，服务器支持 CONDSTORE 时只拉上次以后改过的。
 pub async fn sync_folder<T: Io>(s: &mut Session<T>, db: &Store, f: &Folder) -> Result<Changes> {
@@ -138,6 +140,16 @@ pub async fn sync_folder<T: Io>(s: &mut Session<T>, db: &Store, f: &Folder) -> R
     let max = db.max_uid(f.id)?;
     if complete && mb.uid_next.is_none_or(|n| n > max + 1) {
         ch.new += fetch_headers(s, db, f.id, &format!("{}:*", max + 1)).await?;
+        if f.role.as_deref() == Some("inbox") {
+            for chunk in db.small(f.id, max, PREFETCH)?.chunks(BATCH) {
+                let mut fetched = s.uid_fetch(uid_set(chunk), "BODY.PEEK[]").await?;
+                while let Some(m) = fetched.try_next().await? {
+                    if let (Some(uid), Some(raw)) = (m.uid, m.body()) {
+                        db.put_body(f.id, uid, raw)?;
+                    }
+                }
+            }
+        }
     }
     if !complete || db.stats(f.id)?.0 != mb.exists {
         let server = s.uid_search("ALL").await?;
@@ -264,8 +276,26 @@ pub async fn watch_session<T: Io>(
     loop {
         sync_all(&mut s, db, acc, on).await?;
         let next = Instant::now() + POLL;
-        s.select("INBOX").await?;
+        let inbox = db.folders(acc.id)?.into_iter().find(|f| f.name.eq_ignore_ascii_case("INBOX"));
+        let inbox = inbox.ok_or("服务器没有收件箱")?;
+        // 同步别的文件夹时收件箱又到的信，选中时看 UIDNEXT 才知道；之前攒下的旁路响应属于别的文件夹
+        exists(&mut s);
+        let max = db.max_uid(inbox.id)?;
+        let mut dirty = s.select(&inbox.name).await?.uid_next.is_none_or(|n| n > max + 1);
         loop {
+            if dirty {
+                let ch = sync_folder(&mut s, db, &inbox).await?;
+                if !ch.is_empty() {
+                    on(Event::Changed(&inbox, ch));
+                }
+            }
+            // 同步当中、IDLE 收尾时到的信，服务器的通知不经 IDLE，只进旁路，封数和本地不同就先再同步
+            if let Some(n) = exists(&mut s)
+                && n != db.stats(inbox.id)?.0
+            {
+                dirty = true;
+                continue;
+            }
             let mut idle = s.idle();
             idle.init().await?;
             let (wait, _stop) = idle.wait_with_timeout(KEEP);
@@ -273,18 +303,21 @@ pub async fn watch_session<T: Io>(
             let woke = timeout_at(next, wait).await;
             s = idle.done().await?;
             let Ok(r) = woke else { break };
-            // 安静了 KEEP：重新 IDLE；否则是新数据，或连接被关（下面的同步会报错，转去重连）
-            if matches!(r?, IdleResponse::Timeout) {
-                continue;
-            }
-            let inbox = db.folders(acc.id)?.into_iter().find(|f| f.name.eq_ignore_ascii_case("INBOX"));
-            let inbox = inbox.ok_or("服务器没有收件箱")?;
-            let ch = sync_folder(&mut s, db, &inbox).await?;
-            if !ch.is_empty() {
-                on(Event::Changed(&inbox, ch));
-            }
+            // 安静了 KEEP：重新 IDLE；否则是新数据，或连接被关（同步会报错，转去重连）
+            dirty = !matches!(r?, IdleResponse::Timeout);
         }
     }
+}
+
+/// 取出命令间隙里服务器主动发来、攒在旁路通道里的响应，返回其中最后报的封数（EXISTS）
+fn exists<T: Io>(s: &mut Session<T>) -> Option<u32> {
+    let mut n = None;
+    while let Ok(r) = s.unsolicited_responses.try_recv() {
+        if let UnsolicitedResponse::Exists(e) = r {
+            n = Some(e);
+        }
+    }
+    n
 }
 
 /// 拉一批邮件头存进本地，返回新增封数
@@ -459,6 +492,94 @@ mod tests {
         });
         assert_eq!(preset("a@Hotmail.com"), Some(("outlook.office365.com", "smtp-mail.outlook.com", 587)));
         assert_eq!(preset("a@x.com"), None);
+    }
+
+    #[test]
+    fn catches_mail_between_commands() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(async {
+            let db = Store::open(":memory:").unwrap();
+            db.add_account(&Account { email: "a@x".into(), ..Default::default() }).unwrap();
+            let acc = db.accounts().unwrap().remove(0);
+            let (client, server) = tokio::io::duplex(1 << 16);
+            // 假服务器：每拉一次邮件头就又到一封，在应答里先报 EXISTS 再报完成，这条通知不经 IDLE，只进旁路
+            let fake = async move {
+                let mut s = BufReader::new(server);
+                let (mut n, mut line) = (1u32, String::new());
+                s.write_all(b"* OK ready\r\n").await.unwrap();
+                while s.read_line(&mut line).await.unwrap() > 0 {
+                    let req = std::mem::take(&mut line);
+                    let (tag, cmd) = req.trim_end().split_once(' ').unwrap();
+                    let mut out = String::new();
+                    let uids = |set: &str, n: u32| match set.split_once(':') {
+                        Some((a, _)) => a.parse::<u32>().unwrap()..=n,
+                        None => set.parse().unwrap()..=set.parse().unwrap(),
+                    };
+                    let raw = |u: u32| format!("From: a@x\r\nSubject: m{u}\r\n\r\nbody {u}\r\n");
+                    match cmd.split(' ').collect::<Vec<_>>()[..] {
+                        ["LIST", ..] => out += "* LIST () \"/\" INBOX\r\n",
+                        ["SELECT", _] => out += &format!("* {n} EXISTS\r\n* OK [UIDVALIDITY 1]\r\n* OK [UIDNEXT {}]\r\n", n + 1),
+                        ["UID", "SEARCH", "ALL"] => out += &format!("* SEARCH {}\r\n", (1..=n).map(|u| u.to_string()).collect::<Vec<_>>().join(" ")),
+                        ["UID", "FETCH", set, "BODY.PEEK[]"] => {
+                            for u in uids(set, n) {
+                                out += &format!("* {u} FETCH (UID {u} BODY[] {{{}}}\r\n{})\r\n", raw(u).len(), raw(u));
+                            }
+                        }
+                        ["UID", "FETCH", set, "(UID", "FLAGS)"] => {
+                            for u in uids(set, n) {
+                                out += &format!("* {u} FETCH (UID {u} FLAGS ())\r\n");
+                            }
+                        }
+                        ["UID", "FETCH", set, ..] => {
+                            for u in uids(set, n) {
+                                let (head, size) = (format!("From: a@x\r\nSubject: m{u}\r\n\r\n"), raw(u).len());
+                                out += &format!(
+                                    "* {u} FETCH (UID {u} FLAGS () INTERNALDATE \"28-Oct-2026 10:00:00 -0700\" RFC822.SIZE {size} \
+                                     BODYSTRUCTURE (\"TEXT\" \"PLAIN\" NIL NIL NIL \"7BIT\" 8 1) BODY[HEADER.FIELDS (FROM SUBJECT)] {{{}}}\r\n{head})\r\n",
+                                    head.len()
+                                );
+                            }
+                            if n < 3 {
+                                n += 1;
+                                out += &format!("* {n} EXISTS\r\n");
+                            }
+                        }
+                        ["IDLE"] => {
+                            s.write_all(b"+ idling\r\n").await.unwrap();
+                            s.read_line(&mut line).await.unwrap();
+                            line.clear();
+                        }
+                        _ => {}
+                    }
+                    s.write_all(format!("{out}{tag} OK done\r\n").as_bytes()).await.unwrap();
+                }
+            };
+            tokio::spawn(fake);
+            let s = login(client, "a@x", "p").await.unwrap();
+            let got = std::cell::Cell::new(0);
+            let mut on = |e: Event| {
+                if let Event::Changed(_, c) = e {
+                    got.set(got.get() + c.new);
+                }
+            };
+            let watcher = Box::pin(watch_session(s, &db, &acc, &mut on));
+            let check = Box::pin(async {
+                for _ in 0..30 {
+                    if got.get() == 3 {
+                        return;
+                    }
+                    sleep(Duration::from_millis(100)).await;
+                }
+                panic!("3 秒内只收到 {} 封", got.get());
+            });
+            futures::future::select(watcher, check).await;
+            assert_eq!(got.get(), 3);
+            // 收件箱新到的正文已经顺带取了，首次同步拉下的那封没有
+            let inbox = db.folders(acc.id).unwrap().remove(0).id;
+            assert_eq!(db.body(inbox, 3).unwrap().as_deref(), Some(&b"From: a@x\r\nSubject: m3\r\n\r\nbody 3\r\n"[..]));
+            assert!(db.body(inbox, 2).unwrap().is_some() && db.body(inbox, 1).unwrap().is_none());
+        });
     }
 
     #[test]

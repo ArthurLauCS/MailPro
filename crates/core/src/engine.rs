@@ -117,6 +117,11 @@ async fn run(path: String, mut cmds: UnboundedReceiver<Cmd>, again: UnboundedSen
     }
     while let Some(cmd) = cmds.next().await {
         let (account, job) = match cmd {
+            // 缓存里有就直接回，不排在联网的活后面，没在同步的账号也看得了
+            Cmd::Body { folder, uid, .. } if let Ok(Some(raw)) = db.body(folder.id, uid) => {
+                body(&tx, folder.id, uid, Ok(Some(raw)));
+                continue;
+            }
             Cmd::Body { account, folder, uid } => (account, Job::Body(folder, uid)),
             Cmd::Flush { account, folder } => (account, Job::Flush(folder)),
             Cmd::Move { account, folder, uids, to } => (account, Job::Move(folder, uids, to)),
@@ -219,9 +224,22 @@ fn start(db: &Rc<Store>, acc: Account, running: &mut HashMap<i64, Running>, tx: 
     running.insert(id, Running { sync, worker, jobs, secret });
 }
 
+/// 闲着时每 [`imap::KEEP`] 给手上的连接发 NOOP，代理不会掐断它，下次取正文不用重连；发不出去就丢掉，用时再连
 async fn worker(db: &Store, acc: &Account, secret: &Secret, mut rx: UnboundedReceiver<Job>, tx: &UnboundedSender<Event>) {
-    let mut slot = None;
-    while let Some(first) = rx.next().await {
+    let mut slot: Option<Session> = None;
+    loop {
+        let first = match tokio::time::timeout(imap::KEEP, rx.next()).await {
+            Ok(Some(job)) => job,
+            Ok(None) => return,
+            Err(_) => {
+                if let Some(s) = slot.as_mut()
+                    && !matches!(tokio::time::timeout(imap::KEEP, s.noop()).await, Ok(Ok(())))
+                {
+                    slot = None;
+                }
+                continue;
+            }
+        };
         let mut jobs = vec![first];
         while let Ok(j) = rx.try_recv() {
             jobs.push(j);
@@ -231,16 +249,8 @@ async fn worker(db: &Store, acc: &Account, secret: &Secret, mut rx: UnboundedRec
         for (i, job) in jobs.into_iter().enumerate() {
             match job {
                 Job::Body(f, uid) if Some(i) == last => {
-                    let raw = match db.body(f.id, uid) {
-                        Ok(Some(raw)) => Ok(Some(raw)),
-                        _ => with_session(&mut slot, acc, secret, async |s| imap::fetch_body(s, db, &f, uid).await).await,
-                    };
-                    let msg = match raw {
-                        Ok(Some(raw)) => message::parse(&raw).ok_or(BodyError::Unparsable),
-                        Ok(None) => Err(BodyError::Gone),
-                        Err(e) => Err(BodyError::Net(e.to_string())),
-                    };
-                    let _ = tx.unbounded_send(Event::Body { folder: f.id, uid, msg });
+                    let raw = with_session(&mut slot, acc, secret, async |s| imap::fetch_body(s, db, &f, uid).await).await;
+                    body(tx, f.id, uid, raw);
                 }
                 Job::Body(..) => {}
                 // 失败不用管：改动还记在库里，同步这个文件夹时会写回
@@ -269,6 +279,16 @@ async fn worker(db: &Store, acc: &Account, secret: &Secret, mut rx: UnboundedRec
             }
         }
     }
+}
+
+/// 把取到的原始正文解析好交给界面
+fn body(tx: &UnboundedSender<Event>, folder: i64, uid: u32, raw: Result<Option<Vec<u8>>>) {
+    let msg = match raw {
+        Ok(Some(raw)) => message::parse(&raw).ok_or(BodyError::Unparsable),
+        Ok(None) => Err(BodyError::Gone),
+        Err(e) => Err(BodyError::Net(e.to_string())),
+    };
+    let _ = tx.unbounded_send(Event::Body { folder, uid, msg });
 }
 
 /// 同步一个文件夹，有变化就告诉界面

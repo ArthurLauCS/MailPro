@@ -22,13 +22,13 @@ Checks behind these claims: a test message carrying 31 tracking techniques trigg
 
 ## Download and install
 
-**[Download the installer](https://github.com/ArthurLauCS/MailPro/releases/download/v0.2.0/MailPro-Setup-0.2.0.exe)** · [SHA256 checksums](https://github.com/ArthurLauCS/MailPro/releases/download/v0.2.0/SHA256SUMS.txt)
+**[Download the installer](https://github.com/ArthurLauCS/MailPro/releases/download/v0.3.0/MailPro-Setup-0.3.0.exe)** · [SHA256 checksums](https://github.com/ArthurLauCS/MailPro/releases/download/v0.3.0/SHA256SUMS.txt)
 
-Run `MailPro-Setup-0.2.0.exe` from [GitHub Releases](https://github.com/ArthurLauCS/MailPro/releases/tag/v0.2.0). It installs for the current user under `%LOCALAPPDATA%\Programs\MailPro` and needs no administrator rights.
+Run `MailPro-Setup-0.3.0.exe` from [GitHub Releases](https://github.com/ArthurLauCS/MailPro/releases/tag/v0.3.0). It installs for the current user under `%LOCALAPPDATA%\Programs\MailPro` and needs no administrator rights.
 
 - Windows 10 / 11 x64 with the [WebView2 Runtime](https://developer.microsoft.com/microsoft-edge/webview2/) (included in Windows 11 and in up-to-date Windows 10).
 - The installer offers English and Simplified Chinese; the app's language is chosen separately in the app.
-- The installer is unsigned, so Windows SmartScreen may warn about an unknown publisher: choose **More info → Run anyway**. Check the file against `SHA256SUMS.txt` with `Get-FileHash .\MailPro-Setup-0.2.0.exe -Algorithm SHA256`.
+- The installer is unsigned, so Windows SmartScreen may warn about an unknown publisher: choose **More info → Run anyway**. Check the file against `SHA256SUMS.txt` with `Get-FileHash .\MailPro-Setup-0.3.0.exe -Algorithm SHA256`.
 
 Mail and settings are stored in `%LOCALAPPDATA%\MailPro`; passwords and Outlook sign-in tokens are stored in Windows Credential Manager. Uninstalling removes both.
 
@@ -41,7 +41,7 @@ Mail and settings are stored in `%LOCALAPPDATA%\MailPro`; passwords and Outlook 
 5. Click a message to open it; Ctrl-click adds or removes one, Shift-click selects a range. Archive, delete, move, mark read / unread and star from the buttons at the top of the reader or from the right-click menu; the button at the top of the list marks the whole folder read. Delete moves to Trash, and inside Trash deletes forever after a confirmation. Changes are written to the server; moving and deleting need the account to be connected.
 6. The search box at the top of the list finds messages whose subject or sender contains every word you type. The button next to it switches between **This folder** and **All mailboxes** (every folder of every account; results show their folder). Message bodies are not searched. Clicking a folder clears the search.
 7. The pen button at the top of the list writes a new message; the reader header has **Reply**, **Reply all** and **Forward**, and `mailto:` links open a new message. Closing the window saves a changed message to Drafts; click a draft to continue it. Sent mail is copied to Sent (Gmail does this itself). The sender name is set in the account settings and may be left empty.
-8. Closing the window keeps MailPro running in the notification area, still receiving mail: click its icon to bring the window back, or right-click it and choose **Exit**. Starting MailPro again also brings back the open window. New unread mail in an inbox shows a desktop notification while the window isn't in front: one message shows its sender and subject and opens when clicked; several arriving together show a count for the account and open its inbox. Turn notifications off in Windows Settings → System → Notifications.
+8. Closing the window keeps MailPro running in the notification area, still receiving mail: click its icon to bring the window back, or right-click it and choose **Exit**. Starting MailPro again also brings back the open window. New unread mail in an inbox shows a desktop notification while the window isn't in front: one message shows its sender, subject and the start of its text and opens when clicked; several arriving together list each sender and subject and open the inbox. Until you bring the window to the front, the notification-area icon carries a red dot and an open window's taskbar button flashes; the taskbar button also shows the inbox unread count. Windows 11 hides new notification-area icons in the overflow menu: to see the red dot, turn MailPro on under Settings → Personalization → Taskbar → Other system tray icons. Turn notifications off in Windows Settings → System → Notifications. Mail that arrived while MailPro is running and is still unread is marked **New** in the list. The text of new inbox mail up to 2 MB is downloaded as it arrives, so it opens at once.
 
 ## Current limits
 
