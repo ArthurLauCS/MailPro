@@ -4,7 +4,7 @@
 mod compose;
 
 use crate::i18n::{EN, Lang, ROLES, T, ZH, t};
-use crate::theme::{self, DISPLAY, PROSE, R_MD};
+use crate::theme::{self, BODY, DISPLAY, MONO, R_MD};
 use crate::{browser, tray, webview};
 use compose::{Compose, Respond};
 use chrono::{DateTime, Datelike, Local};
@@ -13,8 +13,8 @@ use futures::channel::mpsc::UnboundedSender;
 use futures::channel::oneshot;
 use gpui::prelude::*;
 use gpui::{
-    AnyElement, App, Bounds, BoxShadow, ClickEvent, ClipboardItem, Context, DismissEvent, Entity, FontWeight, KeyBinding, Modifiers, MouseButton, PathPromptOptions,
-    Pixels, ScrollStrategy, SharedString, Subscription, Task, UniformListScrollHandle, WeakEntity, Window, canvas, div, hsla, point, px, relative,
+    AnyElement, App, Bounds, ClickEvent, ClipboardItem, Context, DismissEvent, Entity, FontWeight, KeyBinding, Modifiers, MouseButton, PathPromptOptions,
+    Pixels, ScrollStrategy, SharedString, Subscription, Task, UniformListScrollHandle, WeakEntity, Window, canvas, div, hsla, px, relative,
     actions, uniform_list, white,
 };
 use gpui_component::button::{Button, ButtonVariants};
@@ -44,8 +44,8 @@ use webview2_com::Microsoft::Web::WebView2::Win32::{COREWEBVIEW2_COLOR, ICoreWeb
 use windows::Win32::Foundation::{HWND, RECT};
 
 /// 邮件列表一行的高度；虚拟列表要求每行等高
-const ROW: f32 = 56.;
-/// 收件箱这么多秒内收到过邮件的账号行泛光
+const ROW: f32 = 52.;
+/// 收件箱这么多秒内收到过邮件的账号行亮起强调色竖条
 const GLOW: i64 = 30 * 60;
 
 // F5：刷新全部邮箱
@@ -206,7 +206,7 @@ pub struct MailPro {
     browser: String,
     /// 左栏收起的账号 id，存在设置 `collapsed` 里（空格分隔），重启后保持
     collapsed: HashSet<i64>,
-    /// 等到最早一个账号该熄灭泛光时重画
+    /// 等到最早一个账号的竖条该熄灭时重画
     glow: Task<()>,
     tray: tray::Tray,
     /// 文件夹 id →（第一次读到它的时刻，那时最大的 uid）：此后收到的才算新信，收件箱的弹通知，未读时列表里标“新”
@@ -392,7 +392,7 @@ impl MailPro {
         cx.notify();
     }
 
-    /// 泛光到期不会有引擎事件来触发重画：等到最早一个账号该熄灭的时刻重画一次，再排下一个
+    /// 竖条到期不会有引擎事件来触发重画：等到最早一个账号该熄灭的时刻重画一次，再排下一个
     fn glow(&mut self, cx: &mut Context<Self>) {
         let now = Local::now().timestamp();
         let next = self.accounts.iter().map(|a| a.latest + GLOW - now).filter(|&s| s > 0).min();
@@ -738,7 +738,7 @@ impl MailPro {
                 }
             }
         }
-        // 新邮件到了可能要亮起泛光，改排熄灭的时刻
+        // 新邮件到了可能要亮起竖条，改排熄灭的时刻
         self.glow(cx);
         cx.notify();
     }
@@ -1005,9 +1005,8 @@ impl MailPro {
             // 收起时正在看的文件夹藏在里面，由账号行代它高亮
             let lit = collapsed && self.sel.is_some_and(|s| s.0 == id);
             let inbox = a.folders.iter().find(|f| f.0.role.as_deref() == Some("inbox")).map_or(0, |f| f.1);
-            // 收件箱最近收到过邮件：账号行淡淡地透出强调色，四周一圈柔光
+            // 收件箱最近收到过邮件：账号行左边一条强调色竖条
             let glow = now - a.latest < GLOW;
-            let halo = BoxShadow { color: theme.primary.opacity(0.22), offset: point(px(0.), px(0.)), blur_radius: px(6.), spread_radius: px(0.), inset: false };
             let dragged = DraggedAccount { id, email: a.acc.email.clone().into() };
             let head = h_flex()
                 .gap_1()
@@ -1019,16 +1018,17 @@ impl MailPro {
                         .gap_1p5()
                         .px_2()
                         .py_1()
+                        .relative()
                         .rounded(R_MD)
                         .cursor_pointer()
-                        .when(glow, |d| d.bg(theme.primary.opacity(0.08)).shadow(vec![halo]))
+                        .when(glow, |d| d.child(div().absolute().left_0().top_1().bottom_1().w(px(2.)).bg(theme.primary)))
                         .when(lit, |d| d.bg(theme.list_active))
                         .when(!lit, |d| d.hover(|d| d.bg(theme.list_hover)))
                         // 拖到别的账号上松开就排到它的位置
                         .on_drag(dragged, |d, _, _, cx| cx.new(|_| d.clone()))
                         .child(Icon::new(if collapsed { IconName::ChevronRight } else { IconName::ChevronDown }).xsmall().text_color(theme.muted_foreground))
                         .child(avatar(id, &a.acc.email))
-                        .child(div().flex_1().truncate().text_sm().font_weight(FontWeight::SEMIBOLD).child(a.acc.email.clone()))
+                        .child(div().flex_1().truncate().font_weight(FontWeight::SEMIBOLD).child(a.acc.email.clone()))
                         .when(a.acc.proxy.is_none(), |d| d.child(div().text_xs().text_color(theme.warning).child(t.direct)))
                         // 收起时断线只亮红点，原因展开后看
                         .when(collapsed && a.error.is_some(), |d| d.child(div().size(px(7.)).flex_none().rounded_full().bg(theme.danger)))
@@ -1054,11 +1054,10 @@ impl MailPro {
                     .pr_2()
                     .py_1()
                     .rounded(R_MD)
-                    .text_sm()
                     .cursor_pointer()
-                    .when(selected, |d| d.bg(theme.list_active).text_color(theme.link).font_weight(FontWeight::SEMIBOLD))
+                    .when(selected, |d| d.bg(theme.list_active).font_weight(FontWeight::SEMIBOLD))
                     .when(!selected, |d| d.hover(|d| d.bg(theme.list_hover)))
-                    .child(Icon::new(folder_icon(f)).small().text_color(if selected { theme.link } else { theme.muted_foreground }))
+                    .child(Icon::new(folder_icon(f)).small().text_color(if selected { theme.foreground } else { theme.muted_foreground }))
                     .child(div().flex_1().truncate().child(folder_label(t, f)))
                     .when(*unread > 0, |d| d.child(badge(unread.to_string(), theme)))
                     // 点文件夹就不再搜索
@@ -1091,7 +1090,7 @@ impl MailPro {
                     .overflow_y_scroll()
                     .p_2()
                     .gap_2()
-                    .when(self.accounts.is_empty(), |d| d.child(div().p_2().font_family(PROSE).text_color(theme.muted_foreground).child(t.no_accounts)))
+                    .when(self.accounts.is_empty(), |d| d.child(div().p_2().text_color(theme.muted_foreground).child(t.no_accounts)))
                     .children(accounts),
             )
             .child(
@@ -1172,20 +1171,19 @@ impl MailPro {
             .border_color(theme.border)
             .cursor_pointer()
             .when(picked, |d| d.bg(theme.list_active).child(div().absolute().left_0().top_0().bottom_0().w(px(3.)).bg(theme.primary)))
-            .when(!picked, |d| d.when(new, |d| d.bg(theme.primary.opacity(0.1))).hover(|d| d.bg(theme.list_hover)))
+            .when(!picked, |d| d.when(new, |d| d.bg(theme.primary.opacity(0.08))).hover(|d| d.bg(theme.list_hover)))
             .child(
                 h_flex()
                     .gap_2()
                     .child(div().size(px(7.)).flex_none().rounded_full().when(unread, |d| d.bg(theme.primary)))
-                    .child(div().flex_1().truncate().text_sm().when(unread, |d| d.font_weight(FontWeight::SEMIBOLD)).child(from.clone()))
+                    .child(div().flex_1().truncate().font_family(DISPLAY).when(unread, |d| d.font_weight(FontWeight::SEMIBOLD)).child(from.clone()))
                     .when(new, |d| d.child(badge(t.new_tag, theme)))
-                    .child(div().flex_none().text_xs().text_color(theme.muted_foreground).child(short_date(t, h.date))),
+                    .child(div().flex_none().font_family(MONO).text_xs().text_color(theme.muted_foreground).child(short_date(t, h.date))),
             )
             .child(
                 h_flex()
                     .gap_2()
                     .pl(px(15.))
-                    .text_sm()
                     .text_color(theme.muted_foreground)
                     .child(div().flex_1().truncate().child(subject))
                     .children(place.map(|p| div().flex_none().max_w(px(180.)).truncate().text_xs().child(p)))
@@ -1288,7 +1286,7 @@ impl MailPro {
                 true => (t.everywhere.to_string(), String::new()),
                 false => (folder_label(t, &self.folder(a, f)?), self.accounts.iter().find(|x| x.acc.id == a)?.acc.email.clone()),
             };
-            let muted = |s: String| div().text_xs().text_color(theme.muted_foreground).child(s);
+            let muted = |s: String| div().font_family(MONO).text_xs().text_color(theme.muted_foreground).child(s);
             Some(
                 h_flex()
                     .flex_none()
@@ -1297,7 +1295,7 @@ impl MailPro {
                     .gap_2()
                     .border_b_1()
                     .border_color(theme.border)
-                    .child(div().flex_none().font_family(DISPLAY).font_weight(FontWeight::BOLD).child(title))
+                    .child(div().flex_none().text_sm().font_weight(FontWeight::SEMIBOLD).child(title))
                     .child(muted(email).flex_1().truncate())
                     .child(muted(format!("{}{}", self.headers.len(), t.messages)).flex_none())
                     .children(all_read),
@@ -1308,14 +1306,7 @@ impl MailPro {
                 .flex_1()
                 .min_h_0()
                 .relative()
-                .when(empty, |d| {
-                    d.flex()
-                        .items_center()
-                        .justify_center()
-                        .font_family(PROSE)
-                        .text_color(theme.muted_foreground)
-                        .child(if searching { t.no_results } else { t.no_messages })
-                })
+                .when(empty, |d| d.p_3().text_color(theme.muted_foreground).child(if searching { t.no_results } else { t.no_messages }))
                 .when(!empty, |d| d.child(rows).vertical_scrollbar(&self.scroll)),
         )
     }
@@ -1346,7 +1337,9 @@ impl MailPro {
             Some(Reading { body: Body::Shown, .. }) => String::new(),
         };
         let head = self.reading.as_ref().map(|r| {
-            let muted = |s: String| div().text_xs().text_color(theme.muted_foreground).child(s);
+            let muted = |s: String| div().font_family(MONO).text_xs().text_color(theme.muted_foreground).child(s);
+            // 名字和地址分开排；没有名字时 from 就是地址
+            let name = r.from.strip_suffix(&format!(" <{}>", r.addr)).unwrap_or(&r.from).to_string();
             let date = DateTime::from_timestamp(r.date, 0).unwrap_or_default().with_timezone(&Local);
             let subject = if r.subject.is_empty() { t.no_subject.to_string() } else { r.subject.clone() };
             v_flex()
@@ -1359,13 +1352,14 @@ impl MailPro {
                     h_flex()
                         .items_start()
                         .gap_2()
-                        .child(div().flex_1().min_w_0().font_family(DISPLAY).text_xl().font_weight(FontWeight::BOLD).line_height(relative(1.3)).child(subject))
+                        .child(div().flex_1().min_w_0().font_family(DISPLAY).text_xl().font_weight(FontWeight::SEMIBOLD).line_height(relative(1.3)).child(subject))
                         .children(head_actions),
                 )
                 .child(
                     h_flex()
                         .gap_2()
-                        .child(div().flex_1().truncate().text_sm().font_weight(FontWeight::SEMIBOLD).child(r.from.clone()))
+                        .child(div().flex_none().max_w_1_2().truncate().font_family(DISPLAY).font_weight(FontWeight::SEMIBOLD).child(name.clone()))
+                        .child(muted(if r.addr.is_empty() || r.addr == name { String::new() } else { r.addr.clone() }).flex_1().truncate())
                         .when(r.date > 0, |d| d.child(muted(date.format("%Y-%m-%d %H:%M").to_string()).flex_none())),
                 )
                 .children(remote)
@@ -1376,7 +1370,7 @@ impl MailPro {
                 .flex_1()
                 .relative()
                 .when(!show, |d| {
-                    d.bg(theme.background).flex().flex_col().gap_3().items_center().justify_center().font_family(PROSE).text_color(theme.muted_foreground).child(status).children(picked_actions)
+                    d.bg(theme.background).flex().flex_col().gap_3().p_4().text_color(theme.muted_foreground).child(status).children(picked_actions)
                 })
                 .child(canvas(place, |_, _, _, _| {}).absolute().size_full()),
         )
@@ -1462,7 +1456,7 @@ fn adspower_dialog(dlg: &Entity<AdsDlg>, view: &WeakEntity<MailPro>, dialog: Dia
         .child(
             v_flex()
                 .gap_3()
-                .child(div().font_family(PROSE).text_sm().line_height(relative(1.7)).text_color(theme.muted_foreground).child(t.adspower_hint))
+                .child(div().text_sm().line_height(relative(1.6)).text_color(theme.muted_foreground).child(t.adspower_hint))
                 .child(field(t.profile_id, &d.id))
                 .child(field("API key", &d.key))
                 .when_some(d.error.clone(), |d, e| d.child(div().text_xs().text_color(theme.danger).child(e))),
@@ -1559,10 +1553,12 @@ fn link_dialog(dlg: &Entity<LinkDlg>, view: &WeakEntity<MailPro>, dialog: Dialog
 impl Render for MailPro {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let show = matches!(self.reading, Some(Reading { body: Body::Shown, .. })) && !window.has_active_dialog(cx) && self.menu.is_none();
-        h_resizable("columns")
-            .child(resizable_panel().size(px(240.)).size_range(px(160.)..px(480.)).child(self.sidebar(cx)))
-            .child(resizable_panel().size(px(380.)).size_range(px(260.)..px(800.)).child(self.list(cx)))
-            .child(resizable_panel().child(self.reader(show, cx)))
+        div().size_full().text_size(BODY).child(
+            h_resizable("columns")
+                .child(resizable_panel().size(px(240.)).size_range(px(160.)..px(480.)).child(self.sidebar(cx)))
+                .child(resizable_panel().size(px(380.)).size_range(px(260.)..px(800.)).child(self.list(cx)))
+                .child(resizable_panel().child(self.reader(show, cx))),
+        )
     }
 }
 
@@ -1595,13 +1591,13 @@ fn form_dialog(form: &Entity<Form>, view: &WeakEntity<MailPro>, dialog: Dialog, 
             v_flex()
                 .gap_3()
                 .when(!settings, |d| d.child(field(t.email, &f.email)))
-                .when(!settings && oauth, |d| d.child(div().font_family(PROSE).text_sm().text_color(theme.muted_foreground).child(t.outlook_hint)))
+                .when(!settings && oauth, |d| d.child(div().text_sm().text_color(theme.muted_foreground).child(t.outlook_hint)))
                 .when(!settings && !oauth, |d| d.child(field(password, &f.secret)))
                 .when(!settings && !preset, |d| d.child(h_flex().gap_2().child(field(t.server, &f.host).flex_1()).child(field(t.port, &f.port).w(px(90.)))))
                 .when(!preset, |d| d.child(h_flex().gap_2().child(field(t.smtp_server, &f.smtp_host).flex_1()).child(field(t.port, &f.smtp_port).w(px(90.)))))
                 .child(field(t.sender_name, &f.name))
                 .child(field(t.proxy, &f.proxy))
-                .when(direct, |d| d.child(div().font_family(PROSE).text_sm().text_color(theme.warning).child(t.direct_warning)))
+                .when(direct, |d| d.child(div().text_sm().text_color(theme.warning).child(t.direct_warning)))
                 .when_some(f.error.clone(), |d, e| d.child(div().text_xs().text_color(theme.danger).child(e))),
         )
         .footer(
@@ -1633,7 +1629,6 @@ fn delete_dialog(n: usize, view: &WeakEntity<MailPro>, dialog: Dialog, cx: &mut 
         .child(
             v_flex()
                 .gap_1()
-                .font_family(PROSE)
                 .text_sm()
                 .child(format!("{}{n}{}", t.picked, t.messages))
                 .child(div().text_color(theme.muted_foreground).child(t.delete_forever_hint)),
@@ -1680,7 +1675,7 @@ fn hwnd(window: &Window) -> HWND {
 }
 
 fn title(s: &str) -> impl IntoElement {
-    div().font_family(DISPLAY).text_xl().font_weight(FontWeight::BOLD).child(s.to_string())
+    div().text_base().font_weight(FontWeight::SEMIBOLD).child(s.to_string())
 }
 
 /// 账号的首字母圆标；色相按账号 id 取黄金分割步进，相邻账号颜色差得开
@@ -1694,14 +1689,14 @@ fn avatar(id: i64, email: &str) -> impl IntoElement {
         .rounded_full()
         .bg(hsla((id as f32 * 0.618_034).fract(), 0.5, 0.45, 1.))
         .text_xs()
-        .font_weight(FontWeight::BOLD)
+        .font_weight(FontWeight::SEMIBOLD)
         .text_color(white())
         .child(email.chars().next().unwrap_or('?').to_uppercase().to_string())
 }
 
-/// 强调色底白字的小圆角标：未读数、新信的“新”
+/// 强调色的小字：未读数、新信的“新”
 fn badge(s: impl Into<SharedString>, theme: &Theme) -> impl IntoElement {
-    div().flex_none().px_1p5().rounded_full().bg(theme.primary).text_color(theme.primary_foreground).text_xs().font_weight(FontWeight::SEMIBOLD).child(s.into())
+    div().flex_none().font_family(MONO).text_xs().font_weight(FontWeight::SEMIBOLD).text_color(theme.link).child(s.into())
 }
 
 /// 按 `role` 取图标，Gmail 标签等自建文件夹用普通文件夹图标

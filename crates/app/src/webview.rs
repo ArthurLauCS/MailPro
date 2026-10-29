@@ -6,9 +6,10 @@
 //! 整个程序一个实例（系统换深浅色时重建），换邮件时改 [`Current`] 再 [`show`]。
 //! 创建全程走异步回调（由 gpui 的消息循环派发），不嵌套消息循环，避免重入 gpui。
 
+use crate::theme;
 use futures::channel::mpsc::UnboundedSender;
 use mailpro_core::{message::Message, sanitize::BASE};
-use std::cell::RefCell;
+use std::cell::{OnceCell, RefCell};
 use std::rc::Rc;
 use webview2_com::Microsoft::Web::WebView2::Win32::*;
 use webview2_com::{
@@ -61,8 +62,10 @@ impl Drop for Pending {
     }
 }
 
-/// 第二道防线：即使清洗漏了，页面也只能从本地地址取图片、只能用内联样式
-const CSP: &str = "default-src 'none'; img-src https://mailpro.localhost data:; style-src 'unsafe-inline'; font-src data:";
+/// 第二道防线：即使清洗漏了，页面也只能从本地地址取图片和字体、只能用内联样式
+const CSP: &str = "default-src 'none'; img-src https://mailpro.localhost data:; style-src 'unsafe-inline'; font-src https://mailpro.localhost data:";
+
+const FONT: &str = "font/ttf";
 
 const BROWSER_ARGS: &str = "--disable-background-networking --disable-component-update --disable-domain-reliability";
 
@@ -119,7 +122,9 @@ pub fn show(c: &ICoreWebView2Controller, seq: u32) -> Result<()> {
 }
 
 unsafe fn respond(env: &ICoreWebView2Environment, args: &ICoreWebView2WebResourceRequestedEventArgs, status: i32, ct: &str, body: &[u8]) -> Result<()> {
-    let headers = format!("Content-Type: {ct}\nContent-Security-Policy: {CSP}\nCache-Control: no-store");
+    // 字体每封都要用，让内核缓存；其余每次重取
+    let cache = if ct == FONT { "max-age=31536000" } else { "no-store" };
+    let headers = format!("Content-Type: {ct}\nContent-Security-Policy: {CSP}\nCache-Control: {cache}");
     unsafe {
         let stream = if body.is_empty() { None } else { SHCreateMemStream(Some(body)) };
         // 说明文字不能为空：空的会让这次加载一直挂起
@@ -147,6 +152,10 @@ unsafe fn setup(env: &ICoreWebView2Environment, c: &ICoreWebView2Controller, msg
         let mut token = 0;
         let env = env.clone();
         let blocked = tx.clone();
+        // 正文没声明字体的地方用 PROSE：邮件自己的字体写在 body 或元素上，盖过这一条。内核看不到程序加载的字体，
+        // 文件由本地地址应答，第一次用到时才读
+        let style = format!(r#"<style>@font-face{{font-family:"{0}";src:url({BASE}font/prose)}}html{{font-family:"{0}","Microsoft YaHei UI",sans-serif}}</style>"#, theme::PROSE);
+        let font = OnceCell::new();
         wv.cast::<ICoreWebView2_22>()?.AddWebResourceRequestedFilterWithRequestSourceKinds(
             w!("*"),
             COREWEBVIEW2_WEB_RESOURCE_CONTEXT_ALL,
@@ -167,8 +176,16 @@ unsafe fn setup(env: &ICoreWebView2Environment, c: &ICoreWebView2Controller, msg
                 let cur = msg.borrow();
                 let html = cur.as_ref().map_or("", |m| m.body.html.as_str());
                 let inline = |n: &str| cur.as_ref()?.inline.get(n.parse::<usize>().ok()?)?.as_ref();
+                let page;
                 let (status, ct, body): (i32, &str, &[u8]) = match uri.strip_prefix(BASE) {
-                    Some(rest) if rest.starts_with("msg/") => (200, "text/html; charset=utf-8", html.as_bytes()),
+                    Some(rest) if rest.starts_with("msg/") => {
+                        page = format!("{style}{html}");
+                        (200, "text/html; charset=utf-8", page.as_bytes())
+                    }
+                    Some("font/prose") => match font.get_or_init(|| theme::font_file(theme::PROSE_FILE)) {
+                        Some(f) => (200, FONT, f.as_slice()),
+                        None => (404, "text/plain", b""),
+                    },
                     Some(rest) => match rest.strip_prefix("cid/").and_then(inline) {
                         Some((ct, data)) => (200, ct, data),
                         None => (404, "text/plain", b""),

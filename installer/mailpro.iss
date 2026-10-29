@@ -44,6 +44,10 @@ Source: "..\crates\app\assets\fonts\*.ttf"; DestDir: "{app}\fonts"; Flags: ignor
 Source: "..\LICENSE"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\THIRD_PARTY_NOTICES.txt"; DestDir: "{app}"; Flags: ignoreversion
 
+[InstallDelete]
+; 先清空再装，换掉的字体文件不留在里面
+Type: filesandordirs; Name: "{app}\fonts"
+
 [Icons]
 Name: "{autoprograms}\MailPro"; Filename: "{app}\mailpro.exe"
 Name: "{autodesktop}\MailPro"; Filename: "{app}\mailpro.exe"; Tasks: desktopicon
