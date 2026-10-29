@@ -106,7 +106,7 @@ tests/privacy  跟踪测试邮件 + 本地计数服务器
    - 验证：`store::tests::search_matches_every_word`；界面用测试库截图核对当前文件夹无结果、全部邮箱的混合结果和文件夹标注、打开结果标已读、点文件夹清空、切换语言后提示文字。
 8. **收尾**：设置导出 / 导入、图标、安装包、README。
    - 安装包：Inno Setup 按当前用户安装（`scripts/installer.ps1`，产物只留当前版本）；卸载时删数据目录 `%LOCALAPPDATA%\MailPro`，并运行 `mailpro.exe --purge-credentials` 删凭据管理器里 `MailPro/` 开头的全部凭据。图标为粉色信封带封蜡锁孔（`scripts/icon.py`）。
-   - 现状：图标、安装包、README（英文为主，附中文版）、第三方许可声明已完成，0.3.0 发布在 GitHub Releases；设置导出 / 导入未做。
+   - 现状：图标、安装包、README（英文为主，附中文版）、第三方许可声明已完成，0.4.0 发布在 GitHub Releases；设置导出 / 导入未做。
 
 ## 托盘与新信通知
 

@@ -22,13 +22,13 @@
 
 ## 下载安装
 
-**[下载安装包](https://github.com/ArthurLauCS/MailPro/releases/download/v0.3.0/MailPro-Setup-0.3.0.exe)** · [SHA256 校验值](https://github.com/ArthurLauCS/MailPro/releases/download/v0.3.0/SHA256SUMS.txt)
+**[下载安装包](https://github.com/ArthurLauCS/MailPro/releases/download/v0.4.0/MailPro-Setup-0.4.0.exe)** · [SHA256 校验值](https://github.com/ArthurLauCS/MailPro/releases/download/v0.4.0/SHA256SUMS.txt)
 
-从 [GitHub Releases](https://github.com/ArthurLauCS/MailPro/releases/tag/v0.3.0) 下载 `MailPro-Setup-0.3.0.exe` 运行即可。按当前用户安装到 `%LOCALAPPDATA%\Programs\MailPro`，不需要管理员权限。
+从 [GitHub Releases](https://github.com/ArthurLauCS/MailPro/releases/tag/v0.4.0) 下载 `MailPro-Setup-0.4.0.exe` 运行即可。按当前用户安装到 `%LOCALAPPDATA%\Programs\MailPro`，不需要管理员权限。
 
 - Windows 10 / 11 x64，需要 [WebView2 Runtime](https://developer.microsoft.com/microsoft-edge/webview2/)（Windows 11 和保持更新的 Windows 10 已自带）。
 - 安装程序提供中文和英文；软件界面语言在软件里另选。
-- 安装包没有签名，Windows SmartScreen 可能提示未知发布者：点“更多信息 → 仍要运行”。可用 `Get-FileHash .\MailPro-Setup-0.3.0.exe -Algorithm SHA256` 对照 `SHA256SUMS.txt` 校验。
+- 安装包没有签名，Windows SmartScreen 可能提示未知发布者：点“更多信息 → 仍要运行”。可用 `Get-FileHash .\MailPro-Setup-0.4.0.exe -Algorithm SHA256` 对照 `SHA256SUMS.txt` 校验。
 
 邮件和设置存在 `%LOCALAPPDATA%\MailPro`，密码和 Outlook 的登录令牌存在 Windows 凭据管理器。卸载时两者一并删除。
 
