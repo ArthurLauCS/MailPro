@@ -12,10 +12,11 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use webview2_com::Microsoft::Web::WebView2::Win32::*;
 use webview2_com::{
-    CoreWebView2EnvironmentOptions, CreateCoreWebView2ControllerCompletedHandler, CreateCoreWebView2EnvironmentCompletedHandler,
+    AcceleratorKeyPressedEventHandler, CoreWebView2EnvironmentOptions, CreateCoreWebView2ControllerCompletedHandler, CreateCoreWebView2EnvironmentCompletedHandler,
     NavigationStartingEventHandler, NewWindowRequestedEventHandler, WebResourceRequestedEventHandler, take_pwstr,
 };
 use windows::Win32::Foundation::{E_POINTER, HWND};
+use windows::Win32::UI::Input::KeyboardAndMouse::VK_F5;
 use windows::Win32::UI::Shell::SHCreateMemStream;
 use windows::core::{Error, HSTRING, Interface, PCWSTR, PWSTR, Result, w};
 
@@ -27,6 +28,8 @@ pub enum Event {
     Link(usize),
     /// 正文要第 n 张远程图片，用 [`Pending::reply`] 应答
     Image(usize, Pending),
+    /// 焦点在正文里时按了 F5
+    Refresh,
 }
 
 /// 挂起的远程图片请求；不论是否 [`reply`](Pending::reply)，丢掉时都会应答（没给图片就回 404），
@@ -176,6 +179,25 @@ unsafe fn setup(env: &ICoreWebView2Environment, c: &ICoreWebView2Controller, msg
                     }
                 };
                 respond(&env, &args, status, ct, body)
+            })),
+            &mut token,
+        )?;
+
+        // F5 是刷新邮箱，不是重载正文
+        let key = tx.clone();
+        c.add_AcceleratorKeyPressed(
+            &AcceleratorKeyPressedEventHandler::create(Box::new(move |_, args| {
+                let Some(args) = args else { return Ok(()) };
+                let (mut kind, mut vk) = (COREWEBVIEW2_KEY_EVENT_KIND::default(), 0);
+                args.KeyEventKind(&mut kind)?;
+                args.VirtualKey(&mut vk)?;
+                if vk == VK_F5.0 as u32 {
+                    args.SetHandled(true)?;
+                    if kind == COREWEBVIEW2_KEY_EVENT_KIND_KEY_DOWN {
+                        let _ = key.unbounded_send(Event::Refresh);
+                    }
+                }
+                Ok(())
             })),
             &mut token,
         )?;

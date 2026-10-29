@@ -74,7 +74,8 @@ async fn run(args: Vec<&str>) -> Result<()> {
         ["watch"] => {
             let accounts = db.accounts()?;
             let secrets = accounts.iter().map(|a| Secret::load(&a.email)).collect::<Result<Vec<_>>>()?;
-            let watches = accounts.iter().zip(&secrets).map(|(a, s)| imap::watch(&db, a, s, print(&a.email)));
+            let wake = tokio::sync::Notify::new();
+            let watches = accounts.iter().zip(&secrets).map(|(a, s)| imap::watch(&db, a, s, &wake, print(&a.email)));
             futures::future::join_all(watches).await;
         }
         _ => println!("{USAGE}"),
@@ -137,7 +138,7 @@ fn print(email: &str) -> impl FnMut(Event) + '_ {
     move |e| {
         let now = Local::now().format("%H:%M:%S");
         match e {
-            Event::Folders => {}
+            Event::Folders | Event::Synced => {}
             Event::Changed(f, c) => {
                 println!("{now} {email} {}：新 {}，标记变 {}，删 {}", folder_name(&f.name), c.new, c.flags, c.gone)
             }

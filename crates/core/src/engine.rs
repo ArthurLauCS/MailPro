@@ -15,6 +15,7 @@ use futures::channel::oneshot;
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::time::Duration;
+use tokio::sync::Notify;
 use tokio::task::{JoinHandle, LocalSet, spawn_local};
 
 pub enum Cmd {
@@ -31,6 +32,9 @@ pub enum Cmd {
     Cancel,
     /// 账号设置（代理）改了，按新设置重连
     Restart(i64),
+    /// 手动刷新：每个账号立即全量同步，断线等重连的立即重连，取不到密码的再取一次；
+    /// 每个账号都会回 [`Event::Synced`]、[`Event::Error`] 或 [`Event::Expired`] 之一
+    Refresh,
     /// 经代理取一张远程图片，回 (Content-Type, 内容)，失败回 None
     Image { url: String, proxy: Option<String>, reply: oneshot::Sender<Option<(String, Vec<u8>)>> },
     /// 经 SMTP 发出一封，`sent` 给定时再存一份进去（Gmail 自己会存）；回发信的结果
@@ -46,6 +50,8 @@ pub enum Event {
     /// 已连上，文件夹列表已按服务器更新
     Folders(i64),
     Changed { account: i64, folder: i64 },
+    /// 一轮全量同步结束
+    Synced(i64),
     Body { folder: i64, uid: u32, msg: std::result::Result<Message, BodyError> },
     /// 连接断了，稍后自动重连；account 为 0 是数据库打不开
     Error { account: i64, msg: String },
@@ -83,6 +89,7 @@ struct Running {
     worker: JoinHandle<()>,
     jobs: UnboundedSender<Job>,
     secret: Rc<Secret>,
+    wake: Rc<Notify>,
 }
 
 impl Drop for Running {
@@ -153,6 +160,17 @@ async fn run(path: String, mut cmds: UnboundedReceiver<Cmd>, again: UnboundedSen
                 }
                 continue;
             }
+            Cmd::Refresh => {
+                for acc in db.accounts().unwrap_or_default() {
+                    match running.get(&acc.id) {
+                        Some(r) if !r.sync.is_finished() => r.wake.notify_one(),
+                        // 同步只在授权失效时停下，要重新登录
+                        Some(_) => drop(tx.unbounded_send(Event::Expired(acc.id))),
+                        None => start(&db, acc, &mut running, &tx),
+                    }
+                }
+                continue;
+            }
             Cmd::Image { url, proxy, reply } => {
                 spawn_local(async move {
                     let r = tokio::time::timeout(Duration::from_secs(30), http::get(&url, proxy.as_deref())).await;
@@ -209,19 +227,21 @@ fn start(db: &Rc<Store>, acc: Account, running: &mut HashMap<i64, Running>, tx: 
     let acc = Rc::new(acc);
     let (db2, acc2, secret2, tx2) = (db.clone(), acc.clone(), secret.clone(), tx.clone());
     let worker = spawn_local(async move { worker(&db2, &acc2, &secret2, rx, &tx2).await });
-    let (db, tx, secret2) = (db.clone(), tx.clone(), secret.clone());
+    let (db, tx, secret2, wake) = (db.clone(), tx.clone(), secret.clone(), Rc::new(Notify::new()));
+    let wake2 = wake.clone();
     let sync = spawn_local(async move {
-        imap::watch(&db, &acc, &secret2, |e| {
+        imap::watch(&db, &acc, &secret2, &wake2, |e| {
             let _ = tx.unbounded_send(match e {
                 imap::Event::Folders => Event::Folders(id),
                 imap::Event::Changed(f, _) => Event::Changed { account: id, folder: f.id },
+                imap::Event::Synced => Event::Synced(id),
                 imap::Event::Error(msg) => Event::Error { account: id, msg },
                 imap::Event::Expired(_) => Event::Expired(id),
             });
         })
         .await
     });
-    running.insert(id, Running { sync, worker, jobs, secret });
+    running.insert(id, Running { sync, worker, jobs, secret, wake });
 }
 
 /// 闲着时每 [`imap::KEEP`] 给手上的连接发 NOOP，代理不会掐断它，下次取正文不用重连；发不出去就丢掉，用时再连

@@ -13,9 +13,9 @@ use futures::channel::mpsc::UnboundedSender;
 use futures::channel::oneshot;
 use gpui::prelude::*;
 use gpui::{
-    AnyElement, App, Bounds, BoxShadow, ClickEvent, ClipboardItem, Context, DismissEvent, Entity, FontWeight, Modifiers, MouseButton, PathPromptOptions,
+    AnyElement, App, Bounds, BoxShadow, ClickEvent, ClipboardItem, Context, DismissEvent, Entity, FontWeight, KeyBinding, Modifiers, MouseButton, PathPromptOptions,
     Pixels, ScrollStrategy, SharedString, Subscription, Task, UniformListScrollHandle, WeakEntity, Window, canvas, div, hsla, point, px, relative,
-    uniform_list, white,
+    actions, uniform_list, white,
 };
 use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::dialog::Dialog;
@@ -47,6 +47,9 @@ use windows::Win32::Foundation::{HWND, RECT};
 const ROW: f32 = 56.;
 /// 收件箱这么多秒内收到过邮件的账号行泛光
 const GLOW: i64 = 30 * 60;
+
+// F5：刷新全部邮箱
+actions!(mailpro, [Refresh]);
 
 struct Acct {
     acc: Account,
@@ -214,6 +217,8 @@ pub struct MailPro {
     notice: Option<(i64, i64, Option<u32>)>,
     /// 点通知要打开的那封（文件夹 id，uid），列表读好后打开
     goto: Option<(i64, u32)>,
+    /// 手动刷新还没同步完的账号 id；非空时刷新按钮转圈
+    refreshing: HashSet<i64>,
 }
 
 impl MailPro {
@@ -249,6 +254,10 @@ impl MailPro {
             }
         })
         .detach();
+        // 焦点在哪都算：没有元素处理的动作最后交给全局处理
+        cx.bind_keys([KeyBinding::new("f5", Refresh, None)]);
+        let view = cx.entity().downgrade();
+        App::on_action(cx, move |_: &Refresh, cx| drop(view.update(cx, |v, cx| v.refresh(cx))));
         // 关窗口只是藏起来，继续收信；从托盘菜单退出
         window.on_window_should_close(cx, |window, _| {
             tray::hide(hwnd(window));
@@ -312,6 +321,7 @@ impl MailPro {
             notified: HashMap::new(),
             notice: None,
             goto: None,
+            refreshing: HashSet::new(),
         };
         v.viewer(window, cx);
         v.reload_accounts();
@@ -396,6 +406,15 @@ impl MailPro {
             }),
             None => Task::ready(()),
         };
+    }
+
+    /// 全部账号立即全量同步；上一次还没完时不重复发
+    fn refresh(&mut self, cx: &mut Context<Self>) {
+        if self.refreshing.is_empty() {
+            self.refreshing = self.accounts.iter().map(|a| a.acc.id).collect();
+            let _ = self.cmd.unbounded_send(Cmd::Refresh);
+            cx.notify();
+        }
     }
 
     /// 还没选文件夹时选第一个（收件箱排在最前）；`account` 给定时只在该账号里选
@@ -687,11 +706,16 @@ impl MailPro {
                     Err(BodyError::Net(e)) => r.body = Body::Failed(format!("{}{e}", t.load_failed)),
                 }
             }
-            Event::Error { account, msg } => match self.accounts.iter_mut().find(|a| a.acc.id == account) {
-                Some(a) => a.error = Some(msg),
-                None => eprintln!("{msg}"),
-            },
+            Event::Synced(account) => drop(self.refreshing.remove(&account)),
+            Event::Error { account, msg } => {
+                self.refreshing.remove(&account);
+                match self.accounts.iter_mut().find(|a| a.acc.id == account) {
+                    Some(a) => a.error = Some(msg),
+                    None => eprintln!("{msg}"),
+                }
+            }
             Event::Expired(account) => {
+                self.refreshing.remove(&account);
                 if let Some(a) = self.accounts.iter_mut().find(|a| a.acc.id == account) {
                     (a.error, a.expired) = (Some(String::new()), true);
                 }
@@ -776,6 +800,7 @@ impl MailPro {
 
     fn on_webview(&mut self, e: webview::Event, window: &mut Window, cx: &mut Context<Self>) {
         match e {
+            webview::Event::Refresh => self.refresh(cx),
             webview::Event::Ready(c) => {
                 self.web = Some(c);
                 if matches!(self.reading, Some(Reading { body: Body::Shown, .. })) {
@@ -1224,6 +1249,13 @@ impl MailPro {
                 v.scroll.scroll_to_item(0, ScrollStrategy::Top);
                 v.load(cx);
             }));
+        let refresh = Button::new("refresh")
+            .ghost()
+            .small()
+            .icon(IconName::RefreshCw)
+            .loading(!self.refreshing.is_empty())
+            .tooltip(t(cx).refresh)
+            .on_click(cx.listener(|v, _, _, cx| v.refresh(cx)));
         let compose = Button::new("compose")
             .ghost()
             .small()
@@ -1239,6 +1271,7 @@ impl MailPro {
             .border_b_1()
             .border_color(theme.border)
             .child(compose)
+            .child(refresh)
             .child(Input::new(&self.query).small().flex_1().prefix(Icon::new(IconName::Search).small()).cleanable(true))
             .child(scope);
         let empty = self.headers.is_empty() && self.sel.is_some();
