@@ -298,7 +298,7 @@ fn compose_dialog(c: &Entity<Compose>, view: &WeakEntity<MailPro>, dialog: Dialo
                         .child(h_flex().gap_2().child(label(t.bcc)).child(Input::new(&d.bcc).flex_1()))
                 })
                 .child(h_flex().gap_2().child(label(t.subject)).child(Input::new(&d.subject).flex_1()))
-                .child(Textarea::new(&d.body).h(px(320.))),
+                .child(Textarea::new(&d.body).h(px(320.)).font_family(theme::PROSE)),
         )
         .footer(
             h_flex()

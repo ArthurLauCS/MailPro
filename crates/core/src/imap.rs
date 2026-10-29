@@ -7,13 +7,16 @@ use async_imap::extensions::idle::IdleResponse;
 use async_imap::imap_proto::{BodyStructure, NameAttribute};
 use async_imap::types::{Fetch, Flag, Name, UnsolicitedResponse};
 use futures::TryStreamExt;
+use futures::future::{Either, select};
 use mail_parser::MessageParser;
 use std::convert::Infallible;
 use std::fmt::Debug;
+use std::pin::pin;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
-use tokio::time::{Instant, sleep, timeout_at};
+use tokio::sync::Notify;
+use tokio::time::{Instant, timeout, timeout_at};
 use tokio_native_tls::{TlsConnector, TlsStream, native_tls};
 use tokio_socks::tcp::Socks5Stream;
 
@@ -54,6 +57,8 @@ pub enum Event<'a> {
     /// 全量同步开始：已连上，文件夹列表已按服务器更新
     Folders,
     Changed(&'a Folder, Changes),
+    /// 全量同步结束
+    Synced,
     /// 连接断了，稍后重连
     Error(String),
     /// Outlook 的授权失效（令牌端点拒了刷新令牌），不再重连，要重新登录
@@ -117,6 +122,7 @@ pub async fn sync_all<T: Io>(s: &mut Session<T>, db: &Store, acc: &Account, on: 
             on(Event::Changed(&f, ch));
         }
     }
+    on(Event::Synced);
     Ok(())
 }
 
@@ -245,13 +251,14 @@ pub async fn fetch_body<T: Io>(s: &mut Session<T>, db: &Store, f: &Folder, uid: 
 
 /// 一直保持同步：每 [`POLL`] 同步全部文件夹，其间在收件箱上 IDLE（每 [`KEEP`] 重新发起一次，连接不会闲着），收件箱一有变化立即同步。
 /// 断线后等 [`RETRY_MIN`] 起翻倍、封顶 [`RETRY_MAX`] 再重连，一直重试；只有 Outlook 授权失效时停下。
-pub async fn watch(db: &Store, acc: &Account, secret: &Secret, mut on: impl FnMut(Event)) {
+/// `wake` 一响（手动刷新）：连着的立即全量同步，等重连的立即重连。
+pub async fn watch(db: &Store, acc: &Account, secret: &Secret, wake: &Notify, mut on: impl FnMut(Event)) {
     let mut delay = RETRY_MIN;
     loop {
         let err = match connect(acc, secret).await {
             Ok(s) => {
                 delay = RETRY_MIN;
-                let Err(e) = watch_session(s, db, acc, &mut on).await;
+                let Err(e) = watch_session(s, db, acc, wake, &mut on).await;
                 e
             }
             Err(e) => e,
@@ -261,7 +268,7 @@ pub async fn watch(db: &Store, acc: &Account, secret: &Secret, mut on: impl FnMu
             return on(Event::Expired(err.to_string()));
         }
         on(Event::Error(err.to_string()));
-        sleep(delay).await;
+        let _ = timeout(delay, wake.notified()).await;
         delay = (delay * 2).min(RETRY_MAX);
     }
 }
@@ -271,6 +278,7 @@ pub async fn watch_session<T: Io>(
     mut s: Session<T>,
     db: &Store,
     acc: &Account,
+    wake: &Notify,
     on: &mut impl FnMut(Event),
 ) -> Result<Infallible> {
     loop {
@@ -299,10 +307,13 @@ pub async fn watch_session<T: Io>(
             let mut idle = s.idle();
             idle.init().await?;
             let (wait, _stop) = idle.wait_with_timeout(KEEP);
-            // 服务器的保活消息会重置 wait 自己的超时，所以另设截止时间
-            let woke = timeout_at(next, wait).await;
+            // 服务器的保活消息会重置 wait 自己的超时，所以另设截止时间；到时或按了刷新都回去全量同步
+            let woke = match select(pin!(timeout_at(next, wait)), pin!(wake.notified())).await {
+                Either::Left((Ok(r), _)) => Some(r),
+                _ => None,
+            };
             s = idle.done().await?;
-            let Ok(r) = woke else { break };
+            let Some(r) = woke else { break };
             // 安静了 KEEP：重新 IDLE；否则是新数据，或连接被关（同步会报错，转去重连）
             dirty = !matches!(r?, IdleResponse::Timeout);
         }
@@ -448,6 +459,7 @@ pub fn folder_name(raw: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::time::sleep;
 
     #[test]
     fn decodes_folder_names() {
@@ -557,21 +569,31 @@ mod tests {
             };
             tokio::spawn(fake);
             let s = login(client, "a@x", "p").await.unwrap();
-            let got = std::cell::Cell::new(0);
-            let mut on = |e: Event| {
-                if let Event::Changed(_, c) = e {
-                    got.set(got.get() + c.new);
-                }
+            let (got, synced, wake) = (std::cell::Cell::new(0), std::cell::Cell::new(0), Notify::new());
+            let mut on = |e: Event| match e {
+                Event::Changed(_, c) => got.set(got.get() + c.new),
+                Event::Synced => synced.set(synced.get() + 1),
+                _ => {}
             };
-            let watcher = Box::pin(watch_session(s, &db, &acc, &mut on));
+            let watcher = Box::pin(watch_session(s, &db, &acc, &wake, &mut on));
             let check = Box::pin(async {
                 for _ in 0..30 {
                     if got.get() == 3 {
+                        break;
+                    }
+                    sleep(Duration::from_millis(100)).await;
+                }
+                assert_eq!(got.get(), 3, "3 秒内只收到 {} 封", got.get());
+                // 手动刷新：IDLE 中的连接立即再全量同步一遍，不等 POLL
+                let before = synced.get();
+                wake.notify_one();
+                for _ in 0..30 {
+                    if synced.get() > before {
                         return;
                     }
                     sleep(Duration::from_millis(100)).await;
                 }
-                panic!("3 秒内只收到 {} 封", got.get());
+                panic!("刷新后 3 秒内没有再全量同步");
             });
             futures::future::select(watcher, check).await;
             assert_eq!(got.get(), 3);

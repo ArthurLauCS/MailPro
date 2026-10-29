@@ -13,18 +13,10 @@ use gpui_component::Root;
 use mailpro_core::store::{self, Store};
 use mailpro_core::{cred, message};
 use std::borrow::Cow;
-use std::path::PathBuf;
 
-/// 两套中文字体：安装版在 exe 旁的 fonts 目录，开发时在 crates/app/assets/fonts（scripts/fonts.ps1 下载）。
-/// 找不到时不报错，界面退回系统字体。
+/// 打包的字体，找不到时不报错，界面退回系统字体
 fn load_fonts(cx: &mut App) {
-    let exe = std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.join("fonts")));
-    let dev = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets/fonts");
-    let fonts: Vec<Cow<'static, [u8]>> = ["NotoSerifSC-VF.ttf", "LXGWWenKai-Regular.ttf"]
-        .iter()
-        .filter_map(|name| exe.iter().chain([&dev]).find_map(|dir| std::fs::read(dir.join(name)).ok()))
-        .map(Cow::Owned)
-        .collect();
+    let fonts = theme::FONT_FILES.iter().filter_map(|name| theme::font_file(name)).map(Cow::Owned).collect();
     let _ = cx.text_system().add_fonts(fonts);
 }
 

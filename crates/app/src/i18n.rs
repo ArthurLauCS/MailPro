@@ -91,6 +91,7 @@ pub struct T {
     pub no_results: &'static str,
     /// 写信框：标题、各栏、按钮、提示
     pub compose: &'static str,
+    pub refresh: &'static str,
     pub reply: &'static str,
     pub reply_all: &'static str,
     pub forward: &'static str,
@@ -211,6 +212,7 @@ pub static ZH: T = T {
     search_scope: "搜索范围",
     no_results: "没有找到",
     compose: "写信",
+    refresh: "刷新全部邮箱 (F5)",
     reply: "回复",
     reply_all: "全部回复",
     forward: "转发",
@@ -323,6 +325,7 @@ pub static EN: T = T {
     search_scope: "Search scope",
     no_results: "No matches",
     compose: "New message",
+    refresh: "Refresh all mailboxes (F5)",
     reply: "Reply",
     reply_all: "Reply all",
     forward: "Forward",

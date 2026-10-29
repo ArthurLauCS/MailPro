@@ -99,7 +99,8 @@ fn syncs_against_server() {
                 tx.send(c).unwrap();
             }
         };
-        let watcher = Box::pin(imap::watch_session(me, &db, &acc, &mut on));
+        let wake = tokio::sync::Notify::new();
+        let watcher = Box::pin(imap::watch_session(me, &db, &acc, &wake, &mut on));
         let web_side = Box::pin(async {
             sleep(Duration::from_millis(500)).await; // 等 watcher 首轮同步完进入 IDLE
             web.append("INBOX", None, None, mail(5)).await.unwrap();

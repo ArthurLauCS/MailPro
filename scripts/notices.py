@@ -44,7 +44,7 @@ def main():
     entries = rust_packages()
     assets = ROOT / "crates" / "app" / "assets"
     entries.append(("Noto Serif SC (font) 2.003", "", "https://github.com/notofonts/noto-cjk", "OFL-1.1", [assets / "OFL-NotoSerifSC.txt"]))
-    entries.append(("LXGW WenKai (font) 1.530", "", "https://github.com/lxgw/LxgwWenKai", "OFL-1.1", [assets / "OFL-LXGWWenKai.txt"]))
+    entries.append(("LXGW Neo XiHei (font) 1.308", "", "https://github.com/lxgw/LxgwNeoXiHei", "IPA", [assets / "IPA-LXGWNeoXiHei.txt"]))
     texts: dict[str, int] = {}
     blocks = []
     for name, version, repo, license, files in entries:

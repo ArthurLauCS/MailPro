@@ -1,12 +1,12 @@
-﻿# 下载界面用的两套开源中文字体到 crates/app/assets/fonts（不进 git，约 50 MB）。
-# 开发运行和打安装包前各跑一次；文件已在且哈希对得上就跳过。字体许可证都是 SIL OFL 1.1。
+﻿# 下载界面用的两套开源中文字体到 crates/app/assets/fonts（不进 git，约 32 MB）。
+# 开发运行和打安装包前各跑一次；文件已在且哈希对得上就跳过。许可证：思源宋体 SIL OFL 1.1，霞鹜新晰黑 IPA Font License 1.0。
 $dir = "$PSScriptRoot\..\crates\app\assets\fonts"
 New-Item -ItemType Directory -Force $dir | Out-Null
 $fonts = @(
     # 标题和名字：思源宋体（可变字重）
     @{ Name = 'NotoSerifSC-VF.ttf'; Url = 'https://github.com/notofonts/noto-cjk/raw/Serif2.003/Serif/Variable/TTF/Subset/NotoSerifSC-VF.ttf'; Sha256 = '5326cfb097e3ab26fcb39329752b5c0a439bf8d5c4649520e4b492939c352a09' },
-    # 给人读的整段话：霞鹜文楷
-    @{ Name = 'LXGWWenKai-Regular.ttf'; Url = 'https://github.com/lxgw/LxgwWenKai/releases/download/v1.530/LXGWWenKai-Regular.ttf'; Sha256 = '2d73eea94ad808999d90c0000c239a84a33b09d4bc6ab6c5b8bbf1eda8a7fc8b' }
+    # 邮件正文：霞鹜新晰黑，也是正文查看器的默认字体
+    @{ Name = 'LXGWNeoXiHei.ttf'; Url = 'https://github.com/lxgw/LxgwNeoXiHei/releases/download/v1.308/LXGWNeoXiHei.ttf'; Sha256 = '80415d3666d9f51cf42ecf82c5350488e6b3f282ab46a3b90dcaa5e212564ecc' }
 )
 foreach ($f in $fonts) {
     $path = Join-Path $dir $f.Name
