@@ -27,6 +27,7 @@ pub(super) struct Compose {
     more: bool,
     in_reply_to: Option<String>,
     references: Vec<String>,
+    attachments: Vec<Attachment>,
     /// 回复的原信（账号，文件夹，uid），发出后标上已回复
     answers: Option<(i64, i64, u32)>,
     /// 接着写的草稿（账号，文件夹，uid）
@@ -50,6 +51,7 @@ impl Compose {
             body: self.body.read(cx).value().to_string(),
             in_reply_to: self.in_reply_to.clone(),
             references: self.references.clone(),
+            attachments: self.attachments.clone(),
         }
     }
 }
@@ -83,22 +85,24 @@ impl MailPro {
                 let subject = message::reply_subject(&o.subject);
                 (if all { t.reply_all } else { t.reply }, Mail { to: join(&to), cc: join(&cc), subject, body, in_reply_to, references, ..Default::default() })
             }
-            // 转发只带原文，不带附件
+            // 转发带上原信的附件（即阅读区列出的那些），写信框里可以删
             Respond::Forward => {
                 let line = |label: &str, value: String| (!value.is_empty()).then(|| format!("{label}{}{value}", t.colon));
                 let head = [line(t.from, from), line(t.date, date), line(t.subject, o.subject.clone()), line(t.to, join(&o.to)), line(t.cc, join(&o.cc))];
                 let body = format!("\n\n{}\n{}\n\n{}", t.forwarded, head.into_iter().flatten().collect::<Vec<_>>().join("\n"), o.text);
-                (t.forward, Mail { subject: message::forward_subject(&o.subject), body, ..Default::default() })
+                let attachments = self.current.borrow().as_ref().map(|m| m.attachments.clone()).unwrap_or_default();
+                (t.forward, Mail { subject: message::forward_subject(&o.subject), body, attachments, ..Default::default() })
             }
         };
         let answers = (!matches!(kind, Respond::Forward)).then_some((account, folder, uid));
         self.open_compose(account, title, mail, answers, None, window, cx);
     }
 
-    /// 接着写草稿文件夹里的这封
+    /// 接着写草稿文件夹里的这封；它的正文刚显示出来，附件取阅读区的
     pub(super) fn edit_draft(&mut self, account: i64, folder: i64, uid: u32, window: &mut Window, cx: &mut Context<Self>) {
         let Some(o) = self.db.body(folder, uid).ok().flatten().and_then(|raw| message::original(&raw)) else { return };
-        let mail = Mail { to: join(&o.to), cc: join(&o.cc), bcc: join(&o.bcc), subject: o.subject, body: o.text, in_reply_to: o.in_reply_to, references: o.references };
+        let attachments = self.current.borrow().as_ref().map(|m| m.attachments.clone()).unwrap_or_default();
+        let mail = Mail { to: join(&o.to), cc: join(&o.cc), bcc: join(&o.bcc), subject: o.subject, body: o.text, in_reply_to: o.in_reply_to, references: o.references, attachments };
         self.open_compose(account, t(cx).compose, mail, None, Some((account, folder, uid)), window, cx);
     }
 
@@ -111,9 +115,9 @@ impl MailPro {
         let body = cx.new(|cx| TextareaState::new(window, cx).default_value(mail.body.clone()));
         let senders = self.accounts.iter().map(|a| (a.acc.id, sender(&a.acc))).collect();
         let more = !mail.cc.is_empty() || !mail.bcc.is_empty();
-        let (in_reply_to, references) = (mail.in_reply_to, mail.references);
+        let (in_reply_to, references, attachments) = (mail.in_reply_to, mail.references, mail.attachments);
         let initial = (account, Mail::default());
-        let mut c = Compose { account, senders, to, cc, bcc, subject, body, more, in_reply_to, references, answers, draft, initial, title, busy: None, error: None };
+        let mut c = Compose { account, senders, to, cc, bcc, subject, body, more, in_reply_to, references, attachments, answers, draft, initial, title, busy: None, error: None };
         c.initial.1 = c.mail(cx);
         let c = cx.new(|_| c);
         self.compose = Some(c.clone());
@@ -237,6 +241,28 @@ fn status(c: &Entity<Compose>, busy: Option<&'static str>, error: Option<String>
     });
 }
 
+/// 选文件加进附件，可多选；文件在后台读，读不了的在写信框底部报原因
+fn attach(c: &Entity<Compose>, cx: &mut App) {
+    let t = t(cx);
+    let paths = cx.prompt_for_paths(PathPromptOptions { files: true, directories: false, multiple: true, prompt: Some(t.attach.into()) });
+    let c = c.clone();
+    cx.spawn(async move |cx| {
+        let Ok(Ok(Some(paths))) = paths.await else { return };
+        let read = cx.background_spawn(async move { paths.iter().map(|p| Attachment::open(p).map_err(|e| format!("{}{}{}{e}", t.read_failed, p.display(), t.colon))).collect::<Vec<_>>() }).await;
+        c.update(cx, |c, cx| {
+            c.error = None;
+            for r in read {
+                match r {
+                    Ok(a) => c.attachments.push(a),
+                    Err(e) => c.error = Some(e),
+                }
+            }
+            cx.notify();
+        });
+    })
+    .detach();
+}
+
 /// 发件人一栏显示的“名字 <地址>”，没有名字只显示地址
 fn sender(a: &Account) -> String {
     if a.name.is_empty() { a.email.clone() } else { format!("{} <{}>", a.name, a.email) }
@@ -282,7 +308,17 @@ fn compose_dialog(c: &Entity<Compose>, view: &WeakEntity<MailPro>, dialog: Dialo
     let busy = d.busy.is_some();
     let failed = !busy && d.error.is_some();
     let note = d.busy.map(str::to_string).or(d.error.clone());
-    let (discard, send, cancel) = (view.clone(), view.clone(), view.clone());
+    let files = d.attachments.iter().enumerate().map(|(i, a)| {
+        let c = c.clone();
+        chip(a, theme).child(Button::new(("remove", i)).ghost().xsmall().icon(IconName::X).disabled(busy).on_click(move |_, _, cx| {
+            c.update(cx, |c, cx| {
+                c.attachments.remove(i);
+                cx.notify();
+            })
+        }))
+    });
+    let total = format!("{}{}", t.total, size_text(d.attachments.iter().map(|a| a.data.len()).sum()));
+    let (discard, send, cancel, add) = (view.clone(), view.clone(), view.clone(), c.clone());
     dialog
         .title(title(d.title))
         .w(px(720.))
@@ -298,11 +334,15 @@ fn compose_dialog(c: &Entity<Compose>, view: &WeakEntity<MailPro>, dialog: Dialo
                         .child(h_flex().gap_2().child(label(t.bcc)).child(Input::new(&d.bcc).flex_1()))
                 })
                 .child(h_flex().gap_2().child(label(t.subject)).child(Input::new(&d.subject).flex_1()))
-                .child(Textarea::new(&d.body).h(px(320.)).font_family(theme::PROSE)),
+                .child(Textarea::new(&d.body).h(px(320.)).font_family(theme::PROSE))
+                .when(!d.attachments.is_empty(), |v| {
+                    v.child(h_flex().gap_1().flex_wrap().children(files).child(div().text_xs().font_family(MONO).text_color(theme.muted_foreground).child(total)))
+                }),
         )
         .footer(
             h_flex()
                 .gap_2()
+                .child(Button::new("attach").ghost().icon(IconName::Paperclip).label(t.attach).disabled(busy).on_click(move |_, _, cx| attach(&add, cx)))
                 .child(div().flex_1().min_w_0().line_clamp(3).text_xs().text_color(if failed { theme.danger } else { theme.muted_foreground }).children(note))
                 .child(Button::new("discard").label(t.discard).disabled(busy).on_click(move |_, window, cx| {
                     let _ = discard.update(cx, |v, cx| v.finish_compose(window, cx));

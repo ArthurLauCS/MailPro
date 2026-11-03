@@ -320,13 +320,13 @@ async fn resync(slot: &mut Option<Session>, db: &Store, acc: &Account, secret: &
     }
 }
 
-/// 用账号同步连接的那份凭据发信，没在同步就现取；连接卡住时 60 秒后放弃，写信框不会一直显示发送中
+/// 用账号同步连接的那份凭据发信，没在同步就现取；连接卡住时放弃（[`smtp::send`]），写信框不会一直显示发送中
 async fn send(acc: &Account, secret: Option<Rc<Secret>>, mail: &Built) -> Result<()> {
     let secret = match secret {
         Some(s) => s,
         None => Rc::new(Secret::load(&acc.email)?),
     };
-    tokio::time::timeout(Duration::from_secs(60), smtp::send(acc, &secret, mail)).await.map_err(|_| "timeout")?
+    smtp::send(acc, &secret, mail).await
 }
 
 /// 用手上的连接执行；失败就丢掉它，换新连接再试一次（空闲久了服务器会断开）

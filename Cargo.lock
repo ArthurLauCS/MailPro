@@ -3581,6 +3581,7 @@ dependencies = [
  "futures",
  "lettre",
  "mail-parser",
+ "mime_guess",
  "percent-encoding",
  "regex",
  "rusqlite",

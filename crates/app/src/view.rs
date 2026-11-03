@@ -13,7 +13,7 @@ use futures::channel::mpsc::UnboundedSender;
 use futures::channel::oneshot;
 use gpui::prelude::*;
 use gpui::{
-    AnyElement, App, Bounds, ClickEvent, ClipboardItem, Context, DismissEvent, Entity, FontWeight, KeyBinding, Modifiers, MouseButton, PathPromptOptions,
+    AnyElement, App, Bounds, ClickEvent, ClipboardItem, Context, DismissEvent, Div, Entity, FontWeight, KeyBinding, Modifiers, MouseButton, PathPromptOptions,
     Pixels, ScrollStrategy, SharedString, Subscription, Task, UniformListScrollHandle, WeakEntity, Window, canvas, div, hsla, px, relative,
     actions, uniform_list, white,
 };
@@ -31,13 +31,14 @@ use mailpro_core::cred;
 use mailpro_core::engine::{self, BodyError, Cmd, Event};
 use mailpro_core::imap::{self, folder_name};
 use mailpro_core::link::{self, Link};
-use mailpro_core::message::{self, Message};
+use mailpro_core::message::{self, Attachment, Message};
 use mailpro_core::smtp::{self, Mail};
 use mailpro_core::store::{self, Account, Folder, Header, Store};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
+use std::path::Path;
 use std::rc::Rc;
 use std::time::Duration;
 use webview2_com::Microsoft::Web::WebView2::Win32::{COREWEBVIEW2_COLOR, ICoreWebView2Controller};
@@ -849,6 +850,26 @@ impl MailPro {
         cx.spawn(async move |_, _| p.reply(rx.await.ok().flatten())).detach();
     }
 
+    /// 正在看的这封的第 `n` 个附件另存为：系统的存文件框，文件夹沿用上次的，同名由它问是否覆盖
+    fn save_attachment(&mut self, n: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(a) = self.current.borrow().as_ref().and_then(|m| m.attachments.get(n).cloned()) else { return };
+        let path = cx.prompt_for_new_path(Path::new(""), Some(&a.name));
+        cx.spawn_in(window, async move |_, cx| {
+            let Ok(Ok(Some(path))) = path.await else { return };
+            let to = path.clone();
+            let r = cx.background_spawn(async move { std::fs::write(to, a.data) }).await;
+            let _ = cx.update(|window, cx| {
+                let t = t(cx);
+                let n = match r {
+                    Ok(()) => Notification::success(format!("{}{}", t.saved, path.display())),
+                    Err(e) => Notification::error(format!("{}{e}", t.save_failed)),
+                };
+                window.push_notification(n, cx);
+            });
+        })
+        .detach();
+    }
+
     /// 改这次查看是否加载远程图片；`trusted` 给定时同时改发件人名单
     fn set_images(&mut self, images: bool, trusted: Option<bool>, cx: &mut Context<Self>) {
         let Some(r) = &mut self.reading else { return };
@@ -1313,6 +1334,7 @@ impl MailPro {
 
     fn reader(&self, show: bool, cx: &mut Context<Self>) -> impl IntoElement {
         let remote = self.reading.as_ref().filter(|r| matches!(r.body, Body::Shown)).map(|r| self.remote(r, cx));
+        let files = self.reading.as_ref().filter(|r| matches!(r.body, Body::Shown)).and_then(|_| self.files(cx));
         // 操作栏：打开了的那封在头部，多选时在中间
         let actions = (!self.picked.is_empty()).then(|| self.actions(cx));
         let (head_actions, picked_actions) = if self.reading.is_some() { (actions, None) } else { (None, actions) };
@@ -1362,6 +1384,7 @@ impl MailPro {
                         .child(muted(if r.addr.is_empty() || r.addr == name { String::new() } else { r.addr.clone() }).flex_1().truncate())
                         .when(r.date > 0, |d| d.child(muted(date.format("%Y-%m-%d %H:%M").to_string()).flex_none())),
                 )
+                .children(files)
                 .children(remote)
         });
         // gpui 的画面盖在子窗口之上，WebView2 显示时正文区不能画背景
@@ -1374,6 +1397,25 @@ impl MailPro {
                 })
                 .child(canvas(place, |_, _, _, _| {}).absolute().size_full()),
         )
+    }
+
+    /// 阅读区头部的附件，点一个另存为；没有附件时为 None
+    fn files(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let cur = self.current.borrow();
+        let list = &cur.as_ref()?.attachments;
+        let theme = cx.theme();
+        let chips: Vec<_> = list
+            .iter()
+            .enumerate()
+            .map(|(i, a)| {
+                chip(a, theme)
+                    .id(("file", i))
+                    .cursor_pointer()
+                    .hover(|d| d.bg(theme.list_hover))
+                    .on_click(cx.listener(move |v, _, window, cx| v.save_attachment(i, window, cx)))
+            })
+            .collect();
+        (!chips.is_empty()).then(|| h_flex().mt_1().gap_1().flex_wrap().children(chips).into_any_element())
     }
 
     /// 阅读区头部的远程资源提示条：拦下或已加载的域名，及加载图片的按钮
@@ -1692,6 +1734,31 @@ fn avatar(id: i64, email: &str) -> impl IntoElement {
         .font_weight(FontWeight::SEMIBOLD)
         .text_color(white())
         .child(email.chars().next().unwrap_or('?').to_uppercase().to_string())
+}
+
+/// 附件的小块：回形针、文件名、大小
+fn chip(a: &Attachment, theme: &Theme) -> Div {
+    h_flex()
+        .max_w(px(280.))
+        .gap_1()
+        .px_2()
+        .py_1()
+        .rounded(R_MD)
+        .border_1()
+        .border_color(theme.border)
+        .text_xs()
+        .child(Icon::new(IconName::Paperclip).xsmall().text_color(theme.muted_foreground))
+        .child(div().min_w_0().truncate().child(a.name.clone()))
+        .child(div().flex_none().font_family(MONO).text_color(theme.muted_foreground).child(size_text(a.data.len())))
+}
+
+/// 文件大小：不到 1 KB 按字节，不到 1 MB 按 KB 进位取整，再大按 MB 留一位小数
+fn size_text(n: usize) -> String {
+    match n {
+        ..1024 => format!("{n} B"),
+        1024..1_048_576 => format!("{} KB", n.div_ceil(1024)),
+        _ => format!("{:.1} MB", n as f64 / 1_048_576.),
+    }
 }
 
 /// 强调色的小字：未读数、新信的“新”

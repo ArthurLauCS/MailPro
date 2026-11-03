@@ -15,6 +15,8 @@ futures = "0.3"
 lettre = { version = "0.11.23", default-features = false, features = ["builder", "smtp-transport", "tokio1-native-tls"] }
 # full_encoding：GBK / gb2312 / Big5 等非 UTF-8 字符集，中文邮件常见
 mail-parser = { version = "1.0", features = ["full_encoding"] }
+# 写信加附件时按扩展名推断类型；rust-embed 已带着它
+mime_guess = "2"
 percent-encoding = "2"
 regex = "1"
 rusqlite = { version = "0.41", features = ["bundled", "fallible_uint"] }
