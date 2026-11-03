@@ -2,8 +2,9 @@
 
 use crate::sanitize::{self, Clean};
 use lettre::message::Mailbox;
-use mail_parser::{MessageParser, PartKind};
+use mail_parser::{MessagePart, MessageParser, PartKind};
 use regex::{Captures, Regex};
+use std::path::Path;
 use std::sync::LazyLock;
 
 /// 纯文本里的网址。`text_to_html` 已把 `<>&` 转义，网址里的 `&` 成了 `&amp;`，遇到 `&lt;` `&gt;` 即止
@@ -16,6 +17,26 @@ pub struct Message {
     pub body: Clean,
     /// 按 `body.cids` 下标对应的内嵌资源：(Content-Type, 内容)
     pub inline: Vec<Option<(String, Vec<u8>)>>,
+    pub attachments: Vec<Attachment>,
+}
+
+/// 收到的附件，或写信时加的文件
+#[derive(Clone, PartialEq, Debug)]
+pub struct Attachment {
+    /// 已换掉 Windows 文件名里不许有的字符
+    pub name: String,
+    pub ctype: String,
+    /// 解码后的内容
+    pub data: Vec<u8>,
+}
+
+impl Attachment {
+    /// 读一个本地文件，类型按扩展名推断
+    pub fn open(path: &Path) -> std::io::Result<Self> {
+        let name = file_name(&path.file_name().unwrap_or_default().to_string_lossy());
+        let ctype = mime_guess::from_path(path).first_or_octet_stream().to_string();
+        Ok(Attachment { name, ctype, data: std::fs::read(path)? })
+    }
 }
 
 pub fn parse(raw: &[u8]) -> Option<Message> {
@@ -34,8 +55,20 @@ pub fn parse(raw: &[u8]) -> Option<Message> {
         .iter()
         .map(|cid| {
             let part = msg.parts().find(|p| p.content_id().map(|id| id.trim_matches(['<', '>'])) == Some(cid))?;
-            let ct = part.content_type().map(|c| format!("{}/{}", c.ctype(), c.subtype().unwrap_or("octet-stream")));
-            Some((ct.unwrap_or_else(|| "application/octet-stream".into()), part.decoded().into_owned()))
+            Some((content_type(&part), part.decoded().into_owned()))
+        })
+        .collect();
+    // 正文以外的部分都算附件，正文里按 cid: 显示了的图片除外
+    let attachments = msg
+        .attachments()
+        .filter(|p| !p.content_id().is_some_and(|id| body.cids.iter().any(|c| c == id.trim_matches(['<', '>']))))
+        .map(|p| {
+            let ctype = content_type(&p);
+            let name = p.attachment_name().map(file_name).filter(|n| !n.is_empty()).unwrap_or_else(|| {
+                let ext = mime_guess::get_mime_extensions_str(ctype.split(';').next().unwrap_or_default()).and_then(|e| e.first());
+                ext.map_or("attachment".into(), |e| format!("attachment.{e}"))
+            });
+            Attachment { name, ctype, data: p.decoded().into_owned() }
         })
         .collect();
     Some(Message {
@@ -43,7 +76,23 @@ pub fn parse(raw: &[u8]) -> Option<Message> {
         from: from.unwrap_or_default(),
         body,
         inline,
+        attachments,
     })
+}
+
+/// `类型/子类型`，有 charset 时带上；没写的当 application/octet-stream
+fn content_type(p: &MessagePart) -> String {
+    let Some(c) = p.content_type() else { return "application/octet-stream".into() };
+    let ct = format!("{}/{}", c.ctype(), c.subtype().unwrap_or("octet-stream"));
+    match c.attribute("charset") {
+        Some(cs) => format!("{ct}; charset={cs}"),
+        None => ct,
+    }
+}
+
+/// 换掉 Windows 文件名里不许有的字符，去掉首尾空白
+fn file_name(s: &str) -> String {
+    s.chars().map(|c| if c.is_control() || r#"\/:*?"<>|"#.contains(c) { '_' } else { c }).collect::<String>().trim().to_string()
 }
 
 /// 回复、转发、接着写草稿要用的原信内容
@@ -153,6 +202,24 @@ mod tests {
         let m = super::parse(b"Subject: x\r\nContent-Type: text/plain\r\n\r\nSee https://a.example/t?code=1&b=2. Or <https://b.example/>\r\n").unwrap();
         assert_eq!(m.body.links, ["https://a.example/t?code=1&b=2", "https://b.example/"]);
         assert!(m.body.html.contains(r#"">https://b.example/</a>&gt;"#), "{}", m.body.html);
+    }
+
+    #[test]
+    fn lists_attachments() {
+        let raw = "From: a@x\r\nSubject: s\r\nContent-Type: multipart/mixed; boundary=m\r\n\r\n\
+            --m\r\nContent-Type: multipart/related; boundary=r\r\n\r\n\
+            --r\r\nContent-Type: text/html\r\n\r\n<img src=\"cid:logo\">\r\n\
+            --r\r\nContent-Type: image/png\r\nContent-ID: <logo>\r\n\r\nPNG\r\n--r--\r\n\
+            --m\r\nContent-Type: text/plain; charset=gbk\r\nContent-Disposition: attachment; filename*=utf-8''%E6%8A%A5/%E5%91%8A.txt\r\n\
+            Content-Transfer-Encoding: base64\r\n\r\nsuLK1A==\r\n\
+            --m\r\nContent-Type: message/rfc822\r\n\r\nSubject: inner\r\n\r\nhi\r\n--m--\r\n";
+        let m = super::parse(raw.as_bytes()).unwrap();
+        // 正文里显示了的 cid 图片不算；文件名里的 / 换掉；GBK 文本按原字节保存
+        let a = &m.attachments;
+        assert_eq!(a.len(), 2, "{a:?}");
+        assert_eq!((a[0].name.as_str(), a[0].ctype.as_str(), a[0].data.as_slice()), ("报_告.txt", "text/plain; charset=gbk", &[0xB2, 0xE2, 0xCA, 0xD4][..]));
+        assert_eq!((a[1].name.as_str(), a[1].ctype.as_str()), ("attachment.eml", "message/rfc822"));
+        assert!(a[1].data.starts_with(b"Subject: inner"));
     }
 
     #[test]

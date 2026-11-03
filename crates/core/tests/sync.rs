@@ -125,12 +125,13 @@ fn sends_and_saves_drafts() {
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
     rt.block_on(async {
         let acc = Account { email: "u@localhost".into(), name: "U".into(), host: "127.0.0.1".into(), port: 3143, ..Default::default() };
-        let m = Mail { to: "U <u@localhost>".into(), bcc: "hidden@localhost".into(), subject: "测试 发信".into(), body: "第一行\n第二行".into(), ..Default::default() };
+        let file = message::Attachment { name: "报告.txt".into(), ctype: "text/plain".into(), data: b"a\nb".to_vec() };
+        let m = Mail { to: "U <u@localhost>".into(), bcc: "hidden@localhost".into(), subject: "测试 发信".into(), body: "第一行\n第二行".into(), attachments: vec![file], ..Default::default() };
         let b = smtp::build(&acc, &m).unwrap();
         let mut c = smtp::connect(TcpStream::connect(&smtp_addr).await.unwrap()).await.unwrap();
         smtp::deliver(&mut c, "u", "p", false, &b).await.unwrap();
 
-        // 收到的这封：EHLO 报 [127.0.0.1]，没有 Bcc 头
+        // 收到的这封：EHLO 报 [127.0.0.1]，没有 Bcc 头，附件原样
         let mut s = imap::login(TcpStream::connect(&imap_addr).await.unwrap(), "u", "p").await.unwrap();
         s.select("INBOX").await.unwrap();
         let f: Vec<_> = s.fetch("1", "BODY.PEEK[]").await.unwrap().try_collect().await.unwrap();
@@ -139,8 +140,9 @@ fn sends_and_saves_drafts() {
         assert!(text.contains("[127.0.0.1]") && !text.contains("Bcc:"), "{text}");
         let o = message::original(raw).unwrap();
         assert_eq!((o.subject.as_str(), o.text.as_str()), ("测试 发信", "第一行\n第二行"));
+        assert_eq!(message::parse(raw).unwrap().attachments, m.attachments);
 
-        // 草稿：存进文件夹，同步后看得到，带 Bcc 头、已读
+        // 草稿：存进文件夹，同步后看得到，带 Bcc 头、已读、有附件
         s.create("Drafts").await.unwrap();
         let db = Store::open(":memory:").unwrap();
         db.add_account(&acc).unwrap();
@@ -150,7 +152,7 @@ fn sends_and_saves_drafts() {
         imap::append(&mut s, &drafts, &b.copy, "(\\Draft \\Seen)").await.unwrap();
         assert_eq!(imap::sync_folder(&mut s, &db, &drafts).await.unwrap(), Changes { new: 1, ..Default::default() });
         let h = db.list(drafts.id, 1).unwrap().remove(0);
-        assert_eq!((h.subject.as_str(), h.flags & SEEN), ("测试 发信", SEEN));
+        assert_eq!((h.subject.as_str(), h.flags & SEEN, h.attach), ("测试 发信", SEEN, true));
         let raw = imap::fetch_body(&mut s, &db, &drafts, h.uid).await.unwrap().unwrap();
         assert_eq!(message::original(&raw).unwrap().bcc.iter().map(|m| m.email.to_string()).collect::<Vec<_>>(), ["hidden@localhost"]);
     });

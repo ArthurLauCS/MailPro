@@ -1,24 +1,30 @@
-//! 发信：用 lettre 拼成纯文本邮件，经邮箱的代理（[`imap::tcp`]）连 SMTP 发出。587 端口明文连上后
+//! 发信：用 lettre 拼成纯文本邮件（有附件时为 multipart/mixed），经邮箱的代理（[`imap::tcp`]）连 SMTP 发出。587 端口明文连上后
 //! STARTTLS 升级（Outlook），其他端口隐式 TLS；密码账号 PLAIN / LOGIN 登录，Outlook 用 XOAUTH2。
 //! 发信头脱敏：EHLO 报 `[127.0.0.1]` 不报主机名，Message-ID 是随机串加发件人的域名，Date 用 UTC，
 //! 不带 User-Agent / X-Mailer。
 
 use crate::auth::Secret;
 use crate::imap::{self, Io, Result};
+use crate::message::Attachment;
 use crate::store::Account;
 use lettre::address::Envelope;
-use lettre::message::header::ContentType;
-use lettre::message::{Mailbox, Message};
+use lettre::message::header::{ContentTransferEncoding, ContentType};
+use lettre::message::{Body, Mailbox, Message, MultiPart, SinglePart};
 use lettre::transport::smtp::authentication::{Credentials, Mechanism};
 use lettre::transport::smtp::client::{AsyncSmtpConnection, AsyncTokioStream, TlsParameters};
 use lettre::transport::smtp::extension::ClientId;
 use percent_encoding::percent_decode_str;
+use std::future::Future;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::pin::Pin;
-use std::task::{Context, Poll};
-use std::time::SystemTime;
+use std::task::{Context, Poll, ready};
+use std::time::{Duration, SystemTime};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::time::{Instant, Sleep, sleep, timeout};
 use tokio_native_tls::{TlsConnector, native_tls};
+
+/// 发信连接卡住多久放弃：取令牌、连上、加密要在这么久内完成；之后数据还在进出就一直等，大附件经慢代理可以慢慢传
+const STALL: Duration = Duration::from_secs(60);
 
 /// 写信框里的内容；地址栏是用户输入的原文，逗号或分号分隔
 #[derive(Clone, Default, PartialEq, Debug)]
@@ -32,6 +38,7 @@ pub struct Mail {
     pub in_reply_to: Option<String>,
     /// 回复时的 References：原信的 References 再加上它的 Message-ID
     pub references: Vec<String>,
+    pub attachments: Vec<Attachment>,
 }
 
 /// 拼好的一封
@@ -94,23 +101,38 @@ pub fn build(acc: &Account, m: &Mail) -> std::result::Result<Built, String> {
         if keep_bcc {
             b = b.keep_bcc();
         }
-        b.header(ContentType::TEXT_PLAIN).body(m.body.clone()).map(|msg| msg.formatted()).map_err(|e| e.to_string())
+        let msg = if m.attachments.is_empty() {
+            b.header(ContentType::TEXT_PLAIN).body(m.body.clone())
+        } else {
+            // 附件一律 base64：原样保留字节，不会因为纯 ASCII 被当成文本改换行
+            let parts = m.attachments.iter().fold(MultiPart::mixed().singlepart(SinglePart::plain(m.body.clone())), |p, a| {
+                let ct = ContentType::parse(&a.ctype).unwrap_or_else(|_| ContentType::parse("application/octet-stream").unwrap());
+                let body = Body::new_with_encoding(a.data.clone(), ContentTransferEncoding::Base64).expect("base64 accepts any bytes");
+                p.singlepart(lettre::message::Attachment::new(a.name.clone()).body(body, ct))
+            });
+            b.multipart(parts)
+        };
+        msg.map(|msg| msg.formatted()).map_err(|e| e.to_string())
     };
     Ok(Built { send: make(false)?, copy: make(true)?, envelope })
 }
 
 /// 经代理连发信服务器，加密后登录发出。587 端口先明文连上再 STARTTLS，服务器不支持就报错不发，
-/// 密码、令牌不走明文；其他端口一连上就 TLS
+/// 密码、令牌不走明文；其他端口一连上就 TLS。卡住的判定见 [`STALL`]
 pub async fn send(acc: &Account, secret: &Secret, b: &Built) -> Result<()> {
-    let pass = secret.get(&acc.email, acc.proxy.as_deref()).await?;
-    let tcp = imap::tcp(acc.proxy.as_deref(), &acc.smtp_host, acc.smtp_port).await?;
-    let mut c = if acc.smtp_port == 587 {
-        let mut c = connect(tcp).await?;
-        c.starttls(TlsParameters::new(acc.smtp_host.clone())?, &HELLO).await?;
-        c
-    } else {
-        connect(TlsConnector::from(native_tls::TlsConnector::new()?).connect(&acc.smtp_host, tcp).await?).await?
+    let setup = async {
+        let pass = secret.get(&acc.email, acc.proxy.as_deref()).await?;
+        let tcp = Stall::new(imap::tcp(acc.proxy.as_deref(), &acc.smtp_host, acc.smtp_port).await?, STALL);
+        let c = if acc.smtp_port == 587 {
+            let mut c = connect(tcp).await?;
+            c.starttls(TlsParameters::new(acc.smtp_host.clone())?, &HELLO).await?;
+            c
+        } else {
+            connect(TlsConnector::from(native_tls::TlsConnector::new()?).connect(&acc.smtp_host, tcp).await?).await?
+        };
+        Result::Ok((c, pass))
     };
+    let (mut c, pass) = timeout(STALL, setup).await.map_err(|_| "timeout")??;
     deliver(&mut c, &acc.email, &pass, secret.is_oauth(), b).await
 }
 
@@ -194,6 +216,52 @@ impl<T: Io + Sync> AsyncTokioStream for Wire<T> {
     }
 }
 
+/// 字节流 `after` 之内一点进出都没有就报超时；有进出就重新计时
+#[derive(Debug)]
+struct Stall<T> {
+    io: T,
+    after: Duration,
+    timer: Pin<Box<Sleep>>,
+}
+
+impl<T> Stall<T> {
+    fn new(io: T, after: Duration) -> Self {
+        Stall { io, after, timer: Box::pin(sleep(after)) }
+    }
+
+    fn watch<R>(&mut self, cx: &mut Context, r: Poll<std::io::Result<R>>) -> Poll<std::io::Result<R>> {
+        if r.is_ready() {
+            self.timer.as_mut().reset(Instant::now() + self.after);
+            return r;
+        }
+        ready!(self.timer.as_mut().poll(cx));
+        Poll::Ready(Err(std::io::ErrorKind::TimedOut.into()))
+    }
+}
+
+impl<T: AsyncRead + Unpin> AsyncRead for Stall<T> {
+    fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context, buf: &mut ReadBuf) -> Poll<std::io::Result<()>> {
+        let r = Pin::new(&mut self.io).poll_read(cx, buf);
+        self.watch(cx, r)
+    }
+}
+
+impl<T: AsyncWrite + Unpin> AsyncWrite for Stall<T> {
+    fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context, buf: &[u8]) -> Poll<std::io::Result<usize>> {
+        let r = Pin::new(&mut self.io).poll_write(cx, buf);
+        self.watch(cx, r)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<std::io::Result<()>> {
+        let r = Pin::new(&mut self.io).poll_flush(cx);
+        self.watch(cx, r)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.io).poll_shutdown(cx)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -229,6 +297,41 @@ mod tests {
         assert_eq!(addresses(&join(&list)).unwrap(), list);
         // 没有收件人也能拼，只是不能发
         assert!(build(&acc, &Mail::default()).unwrap().envelope.is_none());
+    }
+
+    #[test]
+    fn attaches_files() {
+        let acc = Account { email: "me@example.com".into(), ..Default::default() };
+        let file = |name: &str, ctype: &str, data: &[u8]| Attachment { name: name.into(), ctype: ctype.into(), data: data.to_vec() };
+        // 纯 ASCII 带裸 LF 的文本、二进制都原样往返；中文文件名
+        let attachments = vec![file("报告 1.txt", "text/plain", b"a\nb"), file("x.bin", "application/octet-stream", &[0, 255, 13])];
+        let m = Mail { to: "b@example.org".into(), body: "hi".into(), attachments, ..Default::default() };
+        let b = build(&acc, &m).unwrap();
+        assert_eq!(crate::message::parse(&b.send).unwrap().attachments, m.attachments);
+        // 接着写草稿时正文还在
+        assert_eq!(crate::message::original(&b.copy).unwrap().text, "hi");
+    }
+
+    #[test]
+    fn stalls_only_when_idle() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(async {
+            let ms = Duration::from_millis;
+            // 对方每 50 ms 读一点：一直有进出，总时长超过时限也不算卡住
+            let (a, mut b) = tokio::io::duplex(16);
+            tokio::spawn(async move {
+                let mut buf = [0; 16];
+                while b.read(&mut buf).await.unwrap() > 0 {
+                    sleep(ms(50)).await;
+                }
+            });
+            Stall::new(a, ms(200)).write_all(&[0; 256]).await.unwrap();
+            // 对方不读了：时限到了报超时
+            let (a, _b) = tokio::io::duplex(16);
+            let e = Stall::new(a, ms(200)).write_all(&[0; 256]).await.unwrap_err();
+            assert_eq!(e.kind(), std::io::ErrorKind::TimedOut);
+        });
     }
 
     #[test]
